@@ -1,0 +1,114 @@
+# Release workflow - builds binaries and creates a release
+#
+# Triggered when a tag is pushed (e.g., v0.1.0)
+#
+# Requires: RELEASE_TOKEN secret with repo write access
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Lint (format check and vet)
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build release binaries
+        run: make release
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum tugboat-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release and Upload Assets
+        env:
+          GITEA_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          API_URL="https://gitea.swiftstrike.ai/api/v1"
+          REPO="swiftstrike/tugboat"
+
+          # Delete existing release if it exists
+          EXISTING=$(curl -s -H "Authorization: token $GITEA_TOKEN" "$API_URL/repos/$REPO/releases/tags/$VERSION")
+          EXISTING_ID=$(echo "$EXISTING" | jq -r '.id // empty')
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Deleting existing release $EXISTING_ID..."
+            curl -s -X DELETE -H "Authorization: token $GITEA_TOKEN" "$API_URL/repos/$REPO/releases/$EXISTING_ID"
+          fi
+
+          # Create release
+          RELEASE_BODY=$(cat <<BODY
+          ## Installation
+
+          \`\`\`bash
+          # Linux (amd64)
+          curl -L https://gitea.swiftstrike.ai/swiftstrike/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64 -o tugboat
+          chmod +x tugboat
+          sudo mv tugboat /usr/local/bin/
+
+          # Linux (arm64)
+          curl -L https://gitea.swiftstrike.ai/swiftstrike/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-arm64 -o tugboat
+          chmod +x tugboat
+          sudo mv tugboat /usr/local/bin/
+          \`\`\`
+
+          ## Verify checksums
+
+          \`\`\`bash
+          sha256sum -c checksums.txt
+          \`\`\`
+          BODY
+          )
+
+          RESPONSE=$(curl -s -X POST "$API_URL/repos/$REPO/releases" \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"$VERSION\", \"target_commitish\": \"$GITHUB_SHA\", \"name\": \"$VERSION\", \"body\": $(echo "$RELEASE_BODY" | jq -Rs .), \"draft\": false, \"prerelease\": false}")
+
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          echo "Created release ID: $RELEASE_ID"
+
+          if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release: $RESPONSE"
+            exit 1
+          fi
+
+          # Upload assets from dist/
+          cd dist
+          for FILE in tugboat-${VERSION}-linux-amd64 tugboat-${VERSION}-linux-arm64 checksums.txt; do
+            echo "Uploading $FILE..."
+            curl -s -X POST "$API_URL/repos/$REPO/releases/$RELEASE_ID/assets?name=$FILE" \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$FILE"
+            echo ""
+          done
+
+          echo "Release $VERSION created successfully!"
+          echo "https://gitea.swiftstrike.ai/$REPO/releases/tag/$VERSION"

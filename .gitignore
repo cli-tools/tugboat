@@ -1,0 +1,16 @@
+# Binary and test artifacts
+/tugboat
+/tugboat-*
+coverage.out
+coverage.html
+*.test
+
+# IDE/OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+dist/

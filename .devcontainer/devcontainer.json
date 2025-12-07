@@ -1,0 +1,13 @@
+{
+    "name": "tugboat-dev",
+    "image": "golang:1.23-bookworm",
+    "runArgs": ["--network=host"],
+    "containerEnv": {
+        "GOPATH": "/go",
+        "CGO_ENABLED": "0",
+        "GOPROXY": "https://proxy.golang.org,direct"
+    },
+    "postCreateCommand": "go mod download && go build -o /dev/null ./...",
+    "appCommand": "make run",
+    "shell": "/bin/bash"
+}

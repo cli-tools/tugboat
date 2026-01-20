@@ -1,0 +1,78 @@
+# Release workflow - builds binaries and creates a release
+#
+# Triggered when a tag is pushed (e.g., v0.1.0)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Lint (format check and vet)
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build release binaries
+        run: make release
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum tugboat-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/tugboat-*
+            dist/checksums.txt
+          body: |
+            ## Installation
+
+            ```bash
+            # Linux (amd64)
+            curl -L https://github.com/cli-tools/tugboat/releases/download/${{ steps.version.outputs.VERSION }}/tugboat-${{ steps.version.outputs.VERSION }}-linux-amd64 -o tugboat
+            chmod +x tugboat
+            sudo mv tugboat /usr/local/bin/
+
+            # Linux (arm64)
+            curl -L https://github.com/cli-tools/tugboat/releases/download/${{ steps.version.outputs.VERSION }}/tugboat-${{ steps.version.outputs.VERSION }}-linux-arm64 -o tugboat
+            chmod +x tugboat
+            sudo mv tugboat /usr/local/bin/
+            ```
+
+            ## Verify checksums
+
+            ```bash
+            sha256sum -c checksums.txt
+            ```

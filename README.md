@@ -5,8 +5,18 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 ## Quick Start
 
 1) Install
+
+**Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
-make build   # or download a release
+# Example for Linux amd64
+curl -L https://github.com/cli-tools/tugboat/releases/download/v0.4.5/tugboat-v0.4.5-linux-amd64 -o tugboat
+chmod +x tugboat
+sudo mv tugboat /usr/local/bin/
+```
+
+**From source:**
+```bash
+make build
 sudo mv tugboat /usr/local/bin/
 ```
 

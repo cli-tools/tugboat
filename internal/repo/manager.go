@@ -298,9 +298,9 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		cloneURL := pickCloneURL(repo, m.config.Providers[t.Provider].Options.Clone.Protocol)
 		fmt.Printf("Cloning %s/%s -> %s\n", t.Org, t.Repo, t.Path)
 		cmd := exec.Command("git", "clone", cloneURL, t.Path)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			os.Stderr.Write(out)
 			return err
 		}
 	} else {
@@ -448,6 +448,7 @@ func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
 		if len(flags) > 0 {
 			fmt.Printf("  %s (%s) [%s]\n", s.Path, s.Branch, strings.Join(flags, ", "))
 		} else {
+			fmt.Printf("  [CLEAN]  %s\n", s.Path)
 			clean++
 		}
 	}
@@ -687,17 +688,21 @@ func gitPull(repoPath string, ffOnly bool) error {
 	}
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Stderr.Write(out)
+	}
+	return err
 }
 
 func gitPush(repoPath string) error {
 	cmd := exec.Command("git", "push")
 	cmd.Dir = repoPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Stderr.Write(out)
+	}
+	return err
 }
 
 // markRemoteState annotates archived/orphan based on remote index.

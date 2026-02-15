@@ -175,7 +175,7 @@ type cloneJob struct {
 
 type cloneResult struct {
 	repoName string
-	status   string // cloned | exists | error
+	status   string // cloned | exists | skipped | error
 	err      error
 }
 
@@ -705,6 +705,20 @@ func gitPush(repoPath string) error {
 	return err
 }
 
+// hasUpstreamRef fetches from origin and checks whether the current branch
+// has a corresponding remote-tracking ref. Returns (exists, branchName, error).
+func hasUpstreamRef(repoPath string) (bool, string, error) {
+	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return false, "", fmt.Errorf("getting branch: %w", err)
+	}
+	branch = strings.TrimSpace(branch)
+	gitRun(repoPath, "fetch", "--quiet")
+	upstream := fmt.Sprintf("origin/%s", branch)
+	err = gitRun(repoPath, "rev-parse", "--verify", "--quiet", upstream)
+	return err == nil, branch, nil
+}
+
 // markRemoteState annotates archived/orphan based on remote index.
 func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.Repository) {
 	for i := range statuses {
@@ -773,24 +787,39 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 	}
 
 	results := pool.Run(jobs, workers, func(job pullJob) cloneResult {
-		err := gitPull(job.path, job.ffOnly)
+		hasRef, branch, err := hasUpstreamRef(job.path)
+		if err != nil {
+			return cloneResult{repoName: job.path, status: "error", err: err}
+		}
+		if !hasRef {
+			return cloneResult{
+				repoName: job.path,
+				status:   "skipped",
+				err:      fmt.Errorf("branch %q has no upstream ref on remote", branch),
+			}
+		}
+		err = gitPull(job.path, job.ffOnly)
 		if err != nil {
 			return cloneResult{repoName: job.path, status: "error", err: err}
 		}
 		return cloneResult{repoName: job.path, status: "cloned"}
 	})
 
-	var pulled, failed int
+	var pulled, skipped, failed int
 	for _, r := range results {
-		if r.status == "cloned" {
+		switch r.status {
+		case "cloned":
 			fmt.Printf("  [PULL]  %s\n", r.repoName)
 			pulled++
-		} else {
+		case "skipped":
+			fmt.Printf("  [SKIP]  %s: %v\n", r.repoName, r.err)
+			skipped++
+		default:
 			fmt.Printf("  [ERROR] %s: %v\n", r.repoName, r.err)
 			failed++
 		}
 	}
-	fmt.Printf("Pull complete: %d pulled, %d failed\n", pulled, failed)
+	fmt.Printf("Pull complete: %d pulled, %d skipped, %d failed\n", pulled, skipped, failed)
 	return nil
 }
 

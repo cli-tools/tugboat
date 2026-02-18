@@ -20,7 +20,20 @@ make build
 sudo mv tugboat /usr/local/bin/
 ```
 
-2) Configure `~/.config/tugboat/config.json`
+2) Create a personal access token (PAT) on your provider:
+   - **Gitea:** Settings → Applications → Generate Token with **read:organization** and **read:repository** scopes (add **write:repository** if you use `push`/`sync`).
+   - **GitHub:** Settings → Developer settings → Personal access tokens → Generate with **repo** scope (grants read/write access to repositories, including private ones).
+
+   **Verify your token works:**
+   ```bash
+   # GitHub — should list the repo (returns 404 if the token lacks access)
+   gh api repos/{owner}/{repo} --jq .full_name
+
+   # Gitea
+   curl -s -H "Authorization: token YOUR_TOKEN" https://gitea.acme.com/api/v1/repos/{owner}/{repo} | jq .full_name
+   ```
+
+3) Configure `~/.config/tugboat/config.json`
 ```jsonc
 {
   "providers": {
@@ -36,7 +49,7 @@ sudo mv tugboat /usr/local/bin/
 }
 ```
 
-3) (Optional) Foldouts inside a repo target (`~/acme/mobile-app/.tugboat.json`)
+4) (Optional) Foldouts inside a repo target (`~/acme/mobile-app/.tugboat.json`)
 ```jsonc
 {
   "repos": [
@@ -48,12 +61,12 @@ sudo mv tugboat /usr/local/bin/
 }
 ```
 
-4) Clone
+5) Clone
 ```bash
 tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
 ```
 
-5) Daily
+6) Daily
 ```bash
 tugboat status           # shows dirty/ahead/behind + archived/orphan flags
 tugboat pull             # ff-only pulls

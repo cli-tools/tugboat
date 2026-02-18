@@ -278,7 +278,7 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		return fmt.Errorf("fetching repo %s/%s: %w", t.Org, t.Repo, err)
 	}
 	if repo == nil {
-		return fmt.Errorf("repo %s/%s not found", t.Org, t.Repo)
+		return fmt.Errorf("repo %s/%s not found (check that the repo exists and your token has access)", t.Org, t.Repo)
 	}
 
 	if repo.Empty && excludeEmpty {

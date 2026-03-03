@@ -219,6 +219,7 @@ func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, 
 
 	sort.Slice(repos, func(i, j int) bool { return repos[i].Name < repos[j].Name })
 
+	token := m.config.Providers[t.Provider].Token
 	var jobs []cloneJob
 	for _, r := range repos {
 		if r.Empty && excludeEmpty {
@@ -247,6 +248,7 @@ func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, 
 
 	results := pool.Run(jobs, workers, func(job cloneJob) cloneResult {
 		cmd := exec.Command("git", "clone", job.cloneURL, job.repoPath)
+		cmd.Env = gitEnvWithAuth(token)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return cloneResult{repoName: job.repoName, status: "error", err: fmt.Errorf("%v: %s", err, output)}
@@ -294,10 +296,12 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		return fmt.Errorf("creating parent dir: %w", err)
 	}
 
+	token := m.config.Providers[t.Provider].Token
 	if !isGitRepo(t.Path) {
 		cloneURL := pickCloneURL(repo, m.config.Providers[t.Provider].Options.Clone.Protocol)
 		fmt.Printf("Cloning %s/%s -> %s\n", t.Org, t.Repo, t.Path)
 		cmd := exec.Command("git", "clone", cloneURL, t.Path)
+		cmd.Env = gitEnvWithAuth(token)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			os.Stderr.Write(out)
@@ -356,6 +360,7 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 	fmt.Printf("Foldout: cloning %d repos under %s\n", len(jobs), t.Path)
 	results := pool.Run(jobs, workers, func(job cloneJob) cloneResult {
 		cmd := exec.Command("git", "clone", job.cloneURL, job.repoPath)
+		cmd.Env = gitEnvWithAuth(token)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return cloneResult{repoName: job.repoName, status: "error", err: fmt.Errorf("%v: %s", err, output)}
@@ -394,6 +399,7 @@ type statusJob struct {
 	name     string
 	org      string
 	provider string
+	token    string
 }
 
 type statusResult struct {
@@ -472,6 +478,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 	orgKeySet := make(map[string]bool)
 
 	for _, t := range targets {
+		tok := m.config.Providers[t.Provider].Token
 		if t.Repo == "" {
 			if _, err := os.Stat(t.Path); os.IsNotExist(err) {
 				return nil, nil, fmt.Errorf("target %q path does not exist: %s", t.Name, t.Path)
@@ -488,7 +495,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 				if !isGitRepo(repoPath) {
 					continue
 				}
-				jobs = append(jobs, statusJob{path: repoPath, target: t.Name, name: entry.Name(), org: t.Org, provider: t.Provider})
+				jobs = append(jobs, statusJob{path: repoPath, target: t.Name, name: entry.Name(), org: t.Org, provider: t.Provider, token: tok})
 			}
 			okey := orgKey{provider: t.Provider, org: t.Org}
 			if !orgKeySet[okey.string()] {
@@ -500,7 +507,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 				return nil, nil, fmt.Errorf("target %q path does not exist: %s", t.Name, t.Path)
 			}
 			if isGitRepo(t.Path) {
-				jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider})
+				jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider, token: tok})
 			}
 			// foldout
 			fc, err := loadFoldout(t.Path)
@@ -517,7 +524,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 						if len(parts) == 2 {
 							frOrg = parts[0]
 						}
-						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider})
+						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok})
 					}
 				}
 			}
@@ -536,7 +543,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 
 	results := pool.Run(jobs, workers, func(job statusJob) statusResult {
 		var timing RepoTiming
-		status := getRepoStatus(job.path, job.target, job.org, job.name, job.provider, &timing)
+		status := getRepoStatus(job.path, job.target, job.org, job.name, job.provider, job.token, &timing)
 		return statusResult{status: status, timing: timing}
 	})
 
@@ -570,6 +577,34 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 	return statuses, timings, nil
 }
 
+// ------------ auth helpers --------------
+
+// gitEnvNoPrompt returns the current process environment with
+// GIT_TERMINAL_PROMPT=0 to prevent interactive credential prompts.
+func gitEnvNoPrompt() []string {
+	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+}
+
+// gitEnvWithAuth returns an environment that disables prompts and, when token
+// is non-empty, injects an ephemeral credential helper via GIT_CONFIG env vars
+// so that HTTPS git operations can authenticate without persisting credentials
+// to disk.  SSH operations are unaffected (they use ~/.ssh and ssh-agent).
+func gitEnvWithAuth(token string) []string {
+	env := gitEnvNoPrompt()
+	if token == "" {
+		return env
+	}
+	// Use GIT_CONFIG_COUNT/KEY/VALUE to inject an inline credential helper
+	// that echoes the token.  This avoids mutating .git/config.
+	helper := fmt.Sprintf("!f() { echo username=x-access-token; echo password=%s; }; f", token)
+	env = append(env,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=credential.helper",
+		"GIT_CONFIG_VALUE_0="+helper,
+	)
+	return env
+}
+
 // ------------ git helpers --------------
 
 func isGitRepo(path string) bool {
@@ -578,7 +613,7 @@ func isGitRepo(path string) bool {
 	return err == nil && info.IsDir()
 }
 
-func getRepoStatus(path, target, org, name, provider string, timing *RepoTiming) RepoStatus {
+func getRepoStatus(path, target, org, name, provider, token string, timing *RepoTiming) RepoStatus {
 	totalStart := time.Now()
 	status := RepoStatus{
 		Path:     path,
@@ -602,7 +637,7 @@ func getRepoStatus(path, target, org, name, provider string, timing *RepoTiming)
 
 	// Fetch from remote
 	fetchStart := time.Now()
-	if fetchErr := gitFetchWithStderr(path); fetchErr != "" {
+	if fetchErr := gitFetchWithStderr(path, token); fetchErr != "" {
 		status.RemoteError = fetchErr
 	}
 	if timing != nil {
@@ -655,6 +690,7 @@ func getRepoStatus(path, target, org, name, provider string, timing *RepoTiming)
 func gitOutput(repoPath string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
+	cmd.Env = gitEnvNoPrompt()
 	output, err := cmd.Output()
 	return string(output), err
 }
@@ -662,12 +698,14 @@ func gitOutput(repoPath string, args ...string) (string, error) {
 func gitRun(repoPath string, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
+	cmd.Env = gitEnvNoPrompt()
 	return cmd.Run()
 }
 
-func gitFetchWithStderr(repoPath string) string {
+func gitFetchWithStderr(repoPath, token string) string {
 	cmd := exec.Command("git", "fetch", "--quiet")
 	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -681,13 +719,14 @@ func gitFetchWithStderr(repoPath string) string {
 }
 
 // Pull/Push helpers used by sync-like commands
-func gitPull(repoPath string, ffOnly bool) error {
+func gitPull(repoPath string, ffOnly bool, token string) error {
 	args := []string{"pull"}
 	if ffOnly {
 		args = append(args, "--ff-only")
 	}
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Stderr.Write(out)
@@ -695,9 +734,10 @@ func gitPull(repoPath string, ffOnly bool) error {
 	return err
 }
 
-func gitPush(repoPath string) error {
+func gitPush(repoPath, token string) error {
 	cmd := exec.Command("git", "push")
 	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Stderr.Write(out)
@@ -707,13 +747,17 @@ func gitPush(repoPath string) error {
 
 // hasUpstreamRef fetches from origin and checks whether the current branch
 // has a corresponding remote-tracking ref. Returns (exists, branchName, error).
-func hasUpstreamRef(repoPath string) (bool, string, error) {
+func hasUpstreamRef(repoPath, token string) (bool, string, error) {
 	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
 		return false, "", fmt.Errorf("getting branch: %w", err)
 	}
 	branch = strings.TrimSpace(branch)
-	gitRun(repoPath, "fetch", "--quiet")
+	// Fetch with auth so HTTPS repos can authenticate.
+	cmd := exec.Command("git", "fetch", "--quiet")
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
+	cmd.Run() //nolint:errcheck // best-effort fetch
 	upstream := fmt.Sprintf("origin/%s", branch)
 	err = gitRun(repoPath, "rev-parse", "--verify", "--quiet", upstream)
 	return err == nil, branch, nil
@@ -746,11 +790,13 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 	type pullJob struct {
 		path   string
 		ffOnly bool
+		token  string
 	}
 	var jobs []pullJob
 
 	for _, t := range targets {
 		opts := m.config.Providers[t.Provider].Options
+		tok := m.config.Providers[t.Provider].Token
 		if t.Repo == "" {
 			entries, _ := os.ReadDir(t.Path)
 			for _, e := range entries {
@@ -759,12 +805,12 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 				}
 				p := filepath.Join(t.Path, e.Name())
 				if isGitRepo(p) {
-					jobs = append(jobs, pullJob{path: p, ffOnly: opts.Sync.GetFFOnly()})
+					jobs = append(jobs, pullJob{path: p, ffOnly: opts.Sync.GetFFOnly(), token: tok})
 				}
 			}
 		} else {
 			if isGitRepo(t.Path) {
-				jobs = append(jobs, pullJob{path: t.Path, ffOnly: opts.Sync.GetFFOnly()})
+				jobs = append(jobs, pullJob{path: t.Path, ffOnly: opts.Sync.GetFFOnly(), token: tok})
 			}
 			fc, err := loadFoldout(t.Path)
 			if err != nil {
@@ -774,7 +820,7 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 				for _, fr := range fc.Repos {
 					dest := filepath.Join(t.Path, fr.Target)
 					if isGitRepo(dest) {
-						jobs = append(jobs, pullJob{path: dest, ffOnly: opts.Sync.GetFFOnly()})
+						jobs = append(jobs, pullJob{path: dest, ffOnly: opts.Sync.GetFFOnly(), token: tok})
 					}
 				}
 			}
@@ -787,7 +833,7 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 	}
 
 	results := pool.Run(jobs, workers, func(job pullJob) cloneResult {
-		hasRef, branch, err := hasUpstreamRef(job.path)
+		hasRef, branch, err := hasUpstreamRef(job.path, job.token)
 		if err != nil {
 			return cloneResult{repoName: job.path, status: "error", err: err}
 		}
@@ -798,7 +844,7 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 				err:      fmt.Errorf("branch %q has no upstream ref on remote", branch),
 			}
 		}
-		err = gitPull(job.path, job.ffOnly)
+		err = gitPull(job.path, job.ffOnly, job.token)
 		if err != nil {
 			return cloneResult{repoName: job.path, status: "error", err: err}
 		}
@@ -834,6 +880,12 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 		return err
 	}
 
+	// Build target -> token map for push authentication.
+	tokenMap := make(map[string]string)
+	for _, t := range targets {
+		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
+	}
+
 	var pushed, skipped, failed int
 	for _, s := range statuses {
 		if s.Error != "" {
@@ -849,7 +901,7 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 		if s.Ahead == 0 {
 			continue
 		}
-		if err := gitPush(s.Path); err != nil {
+		if err := gitPush(s.Path, tokenMap[s.Target]); err != nil {
 			fmt.Printf("  [ERROR] %s: %v\n", s.Path, err)
 			failed++
 		} else {
@@ -871,15 +923,18 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 		return err
 	}
 
-	// map target -> options
+	// map target -> options and tokens
 	optMap := make(map[string]config.ProviderOptions)
+	tokenMap := make(map[string]string)
 	for _, t := range targets {
 		optMap[t.Name] = m.config.Providers[t.Provider].Options
+		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
 	}
 
 	var synced, skipped, failed int
 	for _, s := range statuses {
 		opts := optMap[s.Target]
+		tok := tokenMap[s.Target]
 
 		if s.Error != "" {
 			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
@@ -899,7 +954,7 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 				continue
 			}
 			fmt.Printf("  [PULL]  %s: %d behind\n", s.Path, s.Behind)
-			if err := gitPull(s.Path, opts.Sync.GetFFOnly()); err != nil {
+			if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
 				fmt.Printf("    error: %v\n", err)
 				failed++
 				continue
@@ -907,7 +962,7 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 		}
 		if s.Ahead > 0 {
 			fmt.Printf("  [PUSH]  %s: %d ahead\n", s.Path, s.Ahead)
-			if err := gitPush(s.Path); err != nil {
+			if err := gitPush(s.Path, tok); err != nil {
 				fmt.Printf("    error: %v\n", err)
 				failed++
 				continue

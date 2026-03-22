@@ -103,6 +103,7 @@ tugboat sync             # pull then push, ff-only
 ## Safety
 - ff-only pulls, no force pushes.
 - Dirty repos are skipped by sync.
+- Repos left on a deleted feature branch are auto-switched to the default branch (from `origin/HEAD`), unless dirty or carrying unpushed commits.
 - Archived repos flagged; orphans flagged (local but missing remote).
 
 ## Build & Test

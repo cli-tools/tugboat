@@ -37,6 +37,7 @@ type RepoStatus struct {
 	Ahead          int
 	Behind         int
 	CanFastForward bool
+	UpstreamGone   bool
 	Archived       bool
 	Orphan         bool
 	RemoteError    string
@@ -175,7 +176,8 @@ type cloneJob struct {
 
 type cloneResult struct {
 	repoName string
-	status   string // cloned | exists | skipped | error
+	status   string // cloned | exists | skipped | error | reset
+	message  string
 	err      error
 }
 
@@ -669,6 +671,9 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 			fmt.Sscanf(parts[0], "%d", &status.Ahead)
 			fmt.Sscanf(parts[1], "%d", &status.Behind)
 		}
+	} else if status.RemoteError == "" {
+		// rev-list failed after a successful fetch — the upstream ref is gone.
+		status.UpstreamGone = true
 	}
 
 	mergeBaseStart := time.Now()
@@ -747,6 +752,8 @@ func gitPush(repoPath, token string) error {
 
 // hasUpstreamRef fetches from origin and checks whether the current branch
 // has a corresponding remote-tracking ref. Returns (exists, branchName, error).
+// Returns an error if fetch fails, so callers can distinguish "verified missing"
+// from "could not verify".
 func hasUpstreamRef(repoPath, token string) (bool, string, error) {
 	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
@@ -757,10 +764,52 @@ func hasUpstreamRef(repoPath, token string) (bool, string, error) {
 	cmd := exec.Command("git", "fetch", "--quiet")
 	cmd.Dir = repoPath
 	cmd.Env = gitEnvWithAuth(token)
-	cmd.Run() //nolint:errcheck // best-effort fetch
+	if err := cmd.Run(); err != nil {
+		return false, branch, fmt.Errorf("fetch failed: %w", err)
+	}
 	upstream := fmt.Sprintf("origin/%s", branch)
 	err = gitRun(repoPath, "rev-parse", "--verify", "--quiet", upstream)
 	return err == nil, branch, nil
+}
+
+// switchToDefaultBranch switches a repo to its default branch (from origin/HEAD).
+// It refuses to switch if the working tree is dirty. Returns the default branch name.
+func switchToDefaultBranch(repoPath, token string) (string, error) {
+	// Determine default branch from origin/HEAD.
+	ref, err := gitOutput(repoPath, "symbolic-ref", "refs/remotes/origin/HEAD")
+	if err != nil {
+		return "", fmt.Errorf("cannot determine default branch (origin/HEAD not set)")
+	}
+	defaultBranch := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "refs/remotes/origin/"))
+	if defaultBranch == "" {
+		return "", fmt.Errorf("empty default branch from origin/HEAD")
+	}
+
+	// Refuse to switch if dirty.
+	dirtyOutput, err := gitOutput(repoPath, "status", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("checking status: %w", err)
+	}
+	if strings.TrimSpace(dirtyOutput) != "" {
+		return "", fmt.Errorf("working tree is dirty")
+	}
+
+	// Refuse to switch if there are local-only commits not on the default branch.
+	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("getting current branch: %w", err)
+	}
+	branch = strings.TrimSpace(branch)
+	localOnly, err := gitOutput(repoPath, "rev-list", fmt.Sprintf("origin/%s..%s", defaultBranch, branch))
+	if err == nil && strings.TrimSpace(localOnly) != "" {
+		return "", fmt.Errorf("branch %s has unpushed commits", branch)
+	}
+
+	// Switch to default branch.
+	if err := gitRun(repoPath, "switch", defaultBranch); err != nil {
+		return "", fmt.Errorf("git switch %s: %w", defaultBranch, err)
+	}
+	return defaultBranch, nil
 }
 
 // markRemoteState annotates archived/orphan based on remote index.
@@ -838,10 +887,21 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 			return cloneResult{repoName: job.path, status: "error", err: err}
 		}
 		if !hasRef {
+			defaultBranch, switchErr := switchToDefaultBranch(job.path, job.token)
+			if switchErr != nil {
+				return cloneResult{
+					repoName: job.path,
+					status:   "skipped",
+					err:      fmt.Errorf("branch %q gone from remote; switch failed: %v", branch, switchErr),
+				}
+			}
+			if err := gitPull(job.path, job.ffOnly, job.token); err != nil {
+				return cloneResult{repoName: job.path, status: "error", err: err}
+			}
 			return cloneResult{
 				repoName: job.path,
-				status:   "skipped",
-				err:      fmt.Errorf("branch %q has no upstream ref on remote", branch),
+				status:   "reset",
+				message:  fmt.Sprintf("%s → %s", branch, defaultBranch),
 			}
 		}
 		err = gitPull(job.path, job.ffOnly, job.token)
@@ -856,6 +916,9 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		switch r.status {
 		case "cloned":
 			fmt.Printf("  [PULL]  %s\n", r.repoName)
+			pulled++
+		case "reset":
+			fmt.Printf("  [RESET] %s: %s\n", r.repoName, r.message)
 			pulled++
 		case "skipped":
 			fmt.Printf("  [SKIP]  %s: %v\n", r.repoName, r.err)
@@ -944,6 +1007,23 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 		if s.Dirty {
 			fmt.Printf("  [SKIP]  %s: dirty\n", s.Path)
 			skipped++
+			continue
+		}
+
+		if s.UpstreamGone {
+			defaultBranch, switchErr := switchToDefaultBranch(s.Path, tok)
+			if switchErr != nil {
+				fmt.Printf("  [SKIP]  %s: upstream gone; switch failed: %v\n", s.Path, switchErr)
+				skipped++
+				continue
+			}
+			fmt.Printf("  [RESET] %s: %s → %s\n", s.Path, s.Branch, defaultBranch)
+			if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
+				fmt.Printf("    error: %v\n", err)
+				failed++
+				continue
+			}
+			synced++
 			continue
 		}
 

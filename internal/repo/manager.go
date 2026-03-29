@@ -176,7 +176,7 @@ type cloneJob struct {
 
 type cloneResult struct {
 	repoName string
-	status   string // cloned | exists | skipped | error | reset
+	status   string // cloned | exists | skipped | error | reset | rebased
 	message  string
 	err      error
 }
@@ -739,6 +739,62 @@ func gitPull(repoPath string, ffOnly bool, token string) error {
 	return err
 }
 
+func gitPullRebase(repoPath string, token string) error {
+	cmd := exec.Command("git", "pull", "--rebase=merges")
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Abort the rebase so the repo is not left in a broken mid-rebase state.
+		abort := exec.Command("git", "rebase", "--abort")
+		abort.Dir = repoPath
+		abort.Env = gitEnvNoPrompt()
+		abort.Run() // best-effort
+		os.Stderr.Write(out)
+	}
+	return err
+}
+
+// gitPullWithFallback tries a normal pull (ff-only when requested) and, if
+// that fails because the branch has diverged, falls back to a rebase pull.
+// Returns (true, nil) when the fallback rebase succeeded.  If the rebase
+// itself fails (e.g. conflicts) it is aborted so the repo stays clean.
+func gitPullWithFallback(repoPath string, ffOnly bool, token string) (rebased bool, err error) {
+	args := []string{"pull"}
+	if ffOnly {
+		args = append(args, "--ff-only")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return false, nil
+	}
+	// Only fall back to rebase when ff-only was requested and the failure is
+	// specifically because branches have diverged.  Other failures (auth,
+	// network, missing remote, etc.) must not trigger a rebase attempt.
+	if !ffOnly || !strings.Contains(string(out), "Not possible to fast-forward") {
+		os.Stderr.Write(out)
+		return false, err
+	}
+	// Fallback: rebase with merge preservation.
+	cmd2 := exec.Command("git", "pull", "--rebase=merges")
+	cmd2.Dir = repoPath
+	cmd2.Env = gitEnvWithAuth(token)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		// Abort the rebase so the repo is not left in a broken mid-rebase state.
+		abort := exec.Command("git", "rebase", "--abort")
+		abort.Dir = repoPath
+		abort.Env = gitEnvNoPrompt()
+		abort.Run() // best-effort
+		os.Stderr.Write(out2)
+		return false, err2
+	}
+	return true, nil
+}
+
 func gitPush(repoPath, token string) error {
 	cmd := exec.Command("git", "push")
 	cmd.Dir = repoPath
@@ -895,8 +951,8 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 					err:      fmt.Errorf("branch %q gone from remote; switch failed: %v", branch, switchErr),
 				}
 			}
-			if err := gitPull(job.path, job.ffOnly, job.token); err != nil {
-				return cloneResult{repoName: job.path, status: "error", err: err}
+			if _, pullErr := gitPullWithFallback(job.path, job.ffOnly, job.token); pullErr != nil {
+				return cloneResult{repoName: job.path, status: "error", err: pullErr}
 			}
 			return cloneResult{
 				repoName: job.path,
@@ -904,9 +960,12 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 				message:  fmt.Sprintf("%s → %s", branch, defaultBranch),
 			}
 		}
-		err = gitPull(job.path, job.ffOnly, job.token)
+		rebased, err := gitPullWithFallback(job.path, job.ffOnly, job.token)
 		if err != nil {
 			return cloneResult{repoName: job.path, status: "error", err: err}
+		}
+		if rebased {
+			return cloneResult{repoName: job.path, status: "rebased"}
 		}
 		return cloneResult{repoName: job.path, status: "cloned"}
 	})
@@ -916,6 +975,9 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		switch r.status {
 		case "cloned":
 			fmt.Printf("  [PULL]  %s\n", r.repoName)
+			pulled++
+		case "rebased":
+			fmt.Printf("  [REBASE] %s\n", r.repoName)
 			pulled++
 		case "reset":
 			fmt.Printf("  [RESET] %s: %s\n", r.repoName, r.message)
@@ -1018,8 +1080,8 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 				continue
 			}
 			fmt.Printf("  [RESET] %s: %s → %s\n", s.Path, s.Branch, defaultBranch)
-			if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
-				fmt.Printf("    error: %v\n", err)
+			if _, pullErr := gitPullWithFallback(s.Path, opts.Sync.GetFFOnly(), tok); pullErr != nil {
+				fmt.Printf("    error: %v\n", pullErr)
 				failed++
 				continue
 			}
@@ -1029,15 +1091,20 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 
 		if s.Behind > 0 {
 			if !s.CanFastForward && opts.Sync.GetFFOnly() {
-				fmt.Printf("  [SKIP]  %s: diverged (ff-only)\n", s.Path)
-				skipped++
-				continue
-			}
-			fmt.Printf("  [PULL]  %s: %d behind\n", s.Path, s.Behind)
-			if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
-				fmt.Printf("    error: %v\n", err)
-				failed++
-				continue
+				// Diverged: ff-only would fail, go straight to rebase.
+				fmt.Printf("  [REBASE] %s: %d behind, %d ahead (diverged)\n", s.Path, s.Behind, s.Ahead)
+				if err := gitPullRebase(s.Path, tok); err != nil {
+					fmt.Printf("    error: %v\n", err)
+					failed++
+					continue
+				}
+			} else {
+				fmt.Printf("  [PULL]  %s: %d behind\n", s.Path, s.Behind)
+				if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
+					fmt.Printf("    error: %v\n", err)
+					failed++
+					continue
+				}
 			}
 		}
 		if s.Ahead > 0 {

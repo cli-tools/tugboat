@@ -69,17 +69,17 @@ tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
 6) Daily
 ```bash
 tugboat status           # shows dirty/ahead/behind + archived/orphan flags
-tugboat pull             # ff-only pulls
+tugboat pull             # ff-only pulls (rebase fallback on divergence)
 tugboat push             # push ahead repos
-tugboat sync             # pull then push, ff-only
+tugboat sync             # pull then push (rebase fallback on divergence)
 ```
 
 ## Commands
 - `clone [target ...]`   — org targets clone all repos; repo targets honor foldouts
 - `status [target ...]`  — reports state; shows archived/orphan via provider metadata
-- `pull [target ...]`    — ff-only pulls (provider option)
+- `pull [target ...]`    — ff-only pulls; falls back to rebase on divergence
 - `push [target ...]`
-- `sync [target ...]`    — pull then push, ff-only
+- `sync [target ...]`    — pull then push; rebases diverged repos instead of skipping
 - `list [target ...]`    — shows local + remote; flags archived/orphan
 - `help`, `version`
 
@@ -101,7 +101,7 @@ tugboat sync             # pull then push, ff-only
 4. `~/.tugboat.json`
 
 ## Safety
-- ff-only pulls, no force pushes.
+- ff-only pulls by default; diverged branches are rebased (rebase is aborted on conflicts).
 - Dirty repos are skipped by sync.
 - Repos left on a deleted feature branch are auto-switched to the default branch (from `origin/HEAD`), unless dirty or carrying unpushed commits.
 - Archived repos flagged; orphans flagged (local but missing remote).

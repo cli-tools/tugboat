@@ -69,17 +69,17 @@ tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
 6) Daily
 ```bash
 tugboat status           # shows dirty/ahead/behind + archived/orphan flags
-tugboat pull             # ff-only pulls (rebase fallback on divergence)
+tugboat pull             # update default branches only; skips dirty/local-only feature branches
 tugboat push             # push ahead repos
-tugboat sync             # pull then push (rebase fallback on divergence)
+tugboat sync             # sync default branches only; skips dirty/local-only feature branches
 ```
 
 ## Commands
 - `clone [target ...]`   — org targets clone all repos; repo targets honor foldouts
 - `status [target ...]`  — reports state; shows archived/orphan via provider metadata
-- `pull [target ...]`    — ff-only pulls; falls back to rebase on divergence
+- `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
 - `push [target ...]`
-- `sync [target ...]`    — pull then push; rebases diverged repos instead of skipping
+- `sync [target ...]`    — syncs default branches only; clean fully-pushed feature branches auto-switch back first
 - `list [target ...]`    — shows local + remote; flags archived/orphan
 - `help`, `version`
 
@@ -102,8 +102,10 @@ tugboat sync             # pull then push (rebase fallback on divergence)
 
 ## Safety
 - ff-only pulls by default; diverged branches are rebased (rebase is aborted on conflicts).
-- Dirty repos are skipped by sync.
-- Repos left on a deleted feature branch are auto-switched to the default branch (from `origin/HEAD`), unless dirty or carrying unpushed commits.
+- `pull` and `sync` only manage each repo's default branch.
+- Clean feature branches with no unpushed commits are auto-switched back to the default branch before `pull` or `sync` continues.
+- Dirty repos and feature branches with local-only commits are skipped rather than updated.
+- Repos left on a deleted feature branch are only switched when the branch has no commits outside the default branch.
 - Archived repos flagged; orphans flagged (local but missing remote).
 
 ## Build & Test

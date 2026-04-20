@@ -93,7 +93,7 @@ Commands:
   sync, s       Sync targets (ff-only)
   status, st    Show status for targets (foldouts included)
   list, ls      List targets (local vs remote); -a/--include-archived
-  pull          Pull targets (ff-only)
+  pull          Update targets on their default branch (ff-only)
   push          Push targets
   migrate       Migrate config from v1 to v2 format
   help          Show this help message
@@ -123,7 +123,7 @@ Configuration:
 
 Examples:
   tugboat clone          # Clone all repos from configured orgs
-  tugboat sync           # Pull and push all repos safely
+  tugboat sync           # Sync default branches safely
   tugboat status         # Show which repos have changes
   tugboat status -w 16   # Use 16 parallel workers
   tugboat list           # List all managed repos

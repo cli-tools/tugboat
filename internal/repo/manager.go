@@ -3,6 +3,7 @@ package repo
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,6 +34,7 @@ type RepoStatus struct {
 	Org            string
 	Name           string
 	Branch         string
+	DefaultBranch  string
 	Dirty          bool
 	Ahead          int
 	Behind         int
@@ -180,6 +182,12 @@ type cloneResult struct {
 	message  string
 	err      error
 }
+
+type updateSkipError struct {
+	reason string
+}
+
+func (e *updateSkipError) Error() string { return e.reason }
 
 func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool, workers int) error {
 	targets, err := m.targetsFor(targetNames)
@@ -527,6 +535,11 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 							frOrg = parts[0]
 						}
 						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok})
+						okey := orgKey{provider: t.Provider, org: frOrg}
+						if !orgKeySet[okey.string()] {
+							orgKeys = append(orgKeys, okey)
+							orgKeySet[okey.string()] = true
+						}
 					}
 				}
 			}
@@ -828,10 +841,7 @@ func hasUpstreamRef(repoPath, token string) (bool, string, error) {
 	return err == nil, branch, nil
 }
 
-// switchToDefaultBranch switches a repo to its default branch (from origin/HEAD).
-// It refuses to switch if the working tree is dirty. Returns the default branch name.
-func switchToDefaultBranch(repoPath, token string) (string, error) {
-	// Determine default branch from origin/HEAD.
+func defaultBranchFromOriginHead(repoPath string) (string, error) {
 	ref, err := gitOutput(repoPath, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err != nil {
 		return "", fmt.Errorf("cannot determine default branch (origin/HEAD not set)")
@@ -840,32 +850,101 @@ func switchToDefaultBranch(repoPath, token string) (string, error) {
 	if defaultBranch == "" {
 		return "", fmt.Errorf("empty default branch from origin/HEAD")
 	}
+	return defaultBranch, nil
+}
 
-	// Refuse to switch if dirty.
+func resolveDefaultBranch(repoPath, remoteDefault string) (string, error) {
+	if strings.TrimSpace(remoteDefault) != "" {
+		return strings.TrimSpace(remoteDefault), nil
+	}
+	return defaultBranchFromOriginHead(repoPath)
+}
+
+func localBranchExists(repoPath, branch string) bool {
+	return gitRun(repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch) == nil
+}
+
+func remoteTrackingRefExists(repoPath, branch string) bool {
+	return gitRun(repoPath, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch) == nil
+}
+
+func branchHasCommitsOutsideDefaultBranch(repoPath, branch, defaultBranch string) (bool, error) {
+	baseRef := "origin/" + defaultBranch
+	if !remoteTrackingRefExists(repoPath, defaultBranch) {
+		if localBranchExists(repoPath, defaultBranch) {
+			baseRef = defaultBranch
+		} else {
+			return false, fmt.Errorf("default branch %q is not available locally or on origin", defaultBranch)
+		}
+	}
+	revList, err := gitOutput(repoPath, "rev-list", fmt.Sprintf("%s..%s", baseRef, branch))
+	if err != nil {
+		return false, fmt.Errorf("checking whether %s is contained in %s: %w", branch, defaultBranch, err)
+	}
+	return strings.TrimSpace(revList) != "", nil
+}
+
+func ensureLocalBranch(repoPath, branch string) error {
+	if localBranchExists(repoPath, branch) {
+		return nil
+	}
+	if !remoteTrackingRefExists(repoPath, branch) {
+		return fmt.Errorf("default branch %q is not available on origin", branch)
+	}
+	cmd := exec.Command("git", "switch", "-c", branch, "--track", "origin/"+branch)
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvNoPrompt()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("creating local %s from origin/%s: %v: %s", branch, branch, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// switchToDefaultBranch moves a repo onto its default branch when it is safe to
+// abandon the current branch context. Dirty repos and branches with local-only
+// commits are refused with updateSkipError so callers can warn and continue.
+func switchToDefaultBranch(repoPath, branch, defaultBranch string) error {
+	if defaultBranch == "" {
+		return fmt.Errorf("default branch is empty")
+	}
+	if branch == defaultBranch {
+		return nil
+	}
+
 	dirtyOutput, err := gitOutput(repoPath, "status", "--porcelain")
 	if err != nil {
-		return "", fmt.Errorf("checking status: %w", err)
+		return fmt.Errorf("checking status: %w", err)
 	}
 	if strings.TrimSpace(dirtyOutput) != "" {
-		return "", fmt.Errorf("working tree is dirty")
+		return &updateSkipError{reason: fmt.Sprintf("on %s, dirty; not updating non-default branch", branch)}
 	}
 
-	// Refuse to switch if there are local-only commits not on the default branch.
-	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("getting current branch: %w", err)
-	}
-	branch = strings.TrimSpace(branch)
-	localOnly, err := gitOutput(repoPath, "rev-list", fmt.Sprintf("origin/%s..%s", defaultBranch, branch))
-	if err == nil && strings.TrimSpace(localOnly) != "" {
-		return "", fmt.Errorf("branch %s has unpushed commits", branch)
+	if remoteTrackingRefExists(repoPath, branch) {
+		localOnly, err := gitOutput(repoPath, "rev-list", fmt.Sprintf("origin/%s..%s", branch, branch))
+		if err != nil {
+			return fmt.Errorf("checking local-only commits on %s: %w", branch, err)
+		}
+		if strings.TrimSpace(localOnly) != "" {
+			return &updateSkipError{reason: fmt.Sprintf("on %s, has local-only commits; not updating non-default branch", branch)}
+		}
+	} else {
+		hasExtraCommits, err := branchHasCommitsOutsideDefaultBranch(repoPath, branch, defaultBranch)
+		if err != nil {
+			return err
+		}
+		if hasExtraCommits {
+			return &updateSkipError{reason: fmt.Sprintf("on %s, commits are not on %s; not switching", branch, defaultBranch)}
+		}
 	}
 
-	// Switch to default branch.
+	if err := ensureLocalBranch(repoPath, defaultBranch); err != nil {
+		return err
+	}
 	if err := gitRun(repoPath, "switch", defaultBranch); err != nil {
-		return "", fmt.Errorf("git switch %s: %w", defaultBranch, err)
+		return fmt.Errorf("git switch %s: %w", defaultBranch, err)
 	}
-	return defaultBranch, nil
+	return nil
 }
 
 // markRemoteState annotates archived/orphan based on remote index.
@@ -879,10 +958,48 @@ func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.R
 		}
 		if r, ok := repos[statuses[i].Name]; ok {
 			statuses[i].Archived = r.Archived
+			statuses[i].DefaultBranch = r.DefaultBranch
 		} else {
 			statuses[i].Orphan = true
 		}
 	}
+}
+
+func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoStatus, bool, error) {
+	defaultBranch := strings.TrimSpace(s.DefaultBranch)
+	if defaultBranch != "" && s.Branch == defaultBranch {
+		return s, false, nil
+	}
+	if defaultBranch == "" {
+		resolvedDefault, err := resolveDefaultBranch(s.Path, s.DefaultBranch)
+		if err != nil {
+			// Fall back to the currently checked out branch when the default
+			// branch cannot be determined at all.
+			return s, false, nil
+		}
+		defaultBranch = resolvedDefault
+		s.DefaultBranch = defaultBranch
+		if s.Branch == defaultBranch {
+			return s, false, nil
+		}
+	}
+
+	if s.Dirty {
+		return s, false, &updateSkipError{reason: fmt.Sprintf("on %s, dirty; not updating non-default branch", s.Branch)}
+	}
+	if s.Ahead > 0 {
+		return s, false, &updateSkipError{reason: fmt.Sprintf("on %s, %d ahead; not updating non-default branch", s.Branch, s.Ahead)}
+	}
+
+	if err := switchToDefaultBranch(s.Path, s.Branch, defaultBranch); err != nil {
+		return s, false, err
+	}
+
+	refreshed := getRepoStatus(s.Path, s.Target, s.Org, s.Name, s.Provider, token, nil)
+	refreshed.DefaultBranch = defaultBranch
+	refreshed.Archived = s.Archived
+	refreshed.Orphan = s.Orphan
+	return refreshed, true, nil
 }
 
 // TODO: implement sync/pull/push/list using the new target model.
@@ -892,104 +1009,80 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		return err
 	}
 
-	type pullJob struct {
-		path   string
-		ffOnly bool
-		token  string
-	}
-	var jobs []pullJob
-
+	var existingTargets []config.Target
 	for _, t := range targets {
-		opts := m.config.Providers[t.Provider].Options
-		tok := m.config.Providers[t.Provider].Token
-		if t.Repo == "" {
-			entries, _ := os.ReadDir(t.Path)
-			for _, e := range entries {
-				if !e.IsDir() {
-					continue
-				}
-				p := filepath.Join(t.Path, e.Name())
-				if isGitRepo(p) {
-					jobs = append(jobs, pullJob{path: p, ffOnly: opts.Sync.GetFFOnly(), token: tok})
-				}
-			}
-		} else {
-			if isGitRepo(t.Path) {
-				jobs = append(jobs, pullJob{path: t.Path, ffOnly: opts.Sync.GetFFOnly(), token: tok})
-			}
-			fc, err := loadFoldout(t.Path)
-			if err != nil {
-				return err
-			}
-			if fc != nil {
-				for _, fr := range fc.Repos {
-					dest := filepath.Join(t.Path, fr.Target)
-					if isGitRepo(dest) {
-						jobs = append(jobs, pullJob{path: dest, ffOnly: opts.Sync.GetFFOnly(), token: tok})
-					}
-				}
-			}
+		if _, err := os.Stat(t.Path); err == nil {
+			existingTargets = append(existingTargets, t)
 		}
 	}
 
-	if len(jobs) == 0 {
+	statuses, _, err := m.getAllStatuses(existingTargets, false, workers)
+	if err != nil {
+		return err
+	}
+	if len(statuses) == 0 {
 		fmt.Println("Pull: no repositories found.")
 		return nil
 	}
 
-	results := pool.Run(jobs, workers, func(job pullJob) cloneResult {
-		hasRef, branch, err := hasUpstreamRef(job.path, job.token)
-		if err != nil {
-			return cloneResult{repoName: job.path, status: "error", err: err}
-		}
-		if !hasRef {
-			defaultBranch, switchErr := switchToDefaultBranch(job.path, job.token)
-			if switchErr != nil {
-				return cloneResult{
-					repoName: job.path,
-					status:   "skipped",
-					err:      fmt.Errorf("branch %q gone from remote; switch failed: %v", branch, switchErr),
-				}
-			}
-			if _, pullErr := gitPullWithFallback(job.path, job.ffOnly, job.token); pullErr != nil {
-				return cloneResult{repoName: job.path, status: "error", err: pullErr}
-			}
-			return cloneResult{
-				repoName: job.path,
-				status:   "reset",
-				message:  fmt.Sprintf("%s → %s", branch, defaultBranch),
-			}
-		}
-		rebased, err := gitPullWithFallback(job.path, job.ffOnly, job.token)
-		if err != nil {
-			return cloneResult{repoName: job.path, status: "error", err: err}
-		}
-		if rebased {
-			return cloneResult{repoName: job.path, status: "rebased"}
-		}
-		return cloneResult{repoName: job.path, status: "cloned"}
-	})
+	optMap := make(map[string]config.ProviderOptions)
+	tokenMap := make(map[string]string)
+	for _, t := range targets {
+		optMap[t.Name] = m.config.Providers[t.Provider].Options
+		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
+	}
 
 	var pulled, skipped, failed int
-	for _, r := range results {
-		switch r.status {
-		case "cloned":
-			fmt.Printf("  [PULL]  %s\n", r.repoName)
-			pulled++
-		case "rebased":
-			fmt.Printf("  [REBASE] %s\n", r.repoName)
-			pulled++
-		case "reset":
-			fmt.Printf("  [RESET] %s: %s\n", r.repoName, r.message)
-			pulled++
-		case "skipped":
-			fmt.Printf("  [SKIP]  %s: %v\n", r.repoName, r.err)
-			skipped++
-		default:
-			fmt.Printf("  [ERROR] %s: %v\n", r.repoName, r.err)
+	for _, s := range statuses {
+		opts := optMap[s.Target]
+		tok := tokenMap[s.Target]
+
+		if s.Error != "" {
+			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
 			failed++
+			continue
 		}
+
+		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
+		if err != nil {
+			var skipErr *updateSkipError
+			if errors.As(err, &skipErr) {
+				fmt.Printf("  [SKIP]  %s: %s\n", s.Path, skipErr.reason)
+				skipped++
+				continue
+			}
+			fmt.Printf("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
+			continue
+		}
+		if switched {
+			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
+		}
+		if prepared.Error != "" {
+			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, prepared.Error)
+			failed++
+			continue
+		}
+		if prepared.Dirty {
+			fmt.Printf("  [SKIP]  %s: dirty\n", prepared.Path)
+			skipped++
+			continue
+		}
+
+		rebased, err := gitPullWithFallback(prepared.Path, opts.Sync.GetFFOnly(), tok)
+		if err != nil {
+			fmt.Printf("  [ERROR] %s: %v\n", prepared.Path, err)
+			failed++
+			continue
+		}
+		if rebased {
+			fmt.Printf("  [REBASE] %s\n", prepared.Path)
+		} else {
+			fmt.Printf("  [PULL]  %s\n", prepared.Path)
+		}
+		pulled++
 	}
+
 	fmt.Printf("Pull complete: %d pulled, %d skipped, %d failed\n", pulled, skipped, failed)
 	return nil
 }
@@ -1066,50 +1159,53 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 			failed++
 			continue
 		}
-		if s.Dirty {
-			fmt.Printf("  [SKIP]  %s: dirty\n", s.Path)
+		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
+		if err != nil {
+			var skipErr *updateSkipError
+			if errors.As(err, &skipErr) {
+				fmt.Printf("  [SKIP]  %s: %s\n", s.Path, skipErr.reason)
+				skipped++
+				continue
+			}
+			fmt.Printf("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
+			continue
+		}
+		if switched {
+			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
+		}
+		if prepared.Error != "" {
+			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, prepared.Error)
+			failed++
+			continue
+		}
+		if prepared.Dirty {
+			fmt.Printf("  [SKIP]  %s: dirty\n", prepared.Path)
 			skipped++
 			continue
 		}
 
-		if s.UpstreamGone {
-			defaultBranch, switchErr := switchToDefaultBranch(s.Path, tok)
-			if switchErr != nil {
-				fmt.Printf("  [SKIP]  %s: upstream gone; switch failed: %v\n", s.Path, switchErr)
-				skipped++
-				continue
-			}
-			fmt.Printf("  [RESET] %s: %s → %s\n", s.Path, s.Branch, defaultBranch)
-			if _, pullErr := gitPullWithFallback(s.Path, opts.Sync.GetFFOnly(), tok); pullErr != nil {
-				fmt.Printf("    error: %v\n", pullErr)
-				failed++
-				continue
-			}
-			synced++
-			continue
-		}
-
-		if s.Behind > 0 {
-			if !s.CanFastForward && opts.Sync.GetFFOnly() {
+		if prepared.Behind > 0 {
+			if !prepared.CanFastForward && opts.Sync.GetFFOnly() {
 				// Diverged: ff-only would fail, go straight to rebase.
-				fmt.Printf("  [REBASE] %s: %d behind, %d ahead (diverged)\n", s.Path, s.Behind, s.Ahead)
-				if err := gitPullRebase(s.Path, tok); err != nil {
+				fmt.Printf("  [REBASE] %s: %d behind, %d ahead (diverged)\n", prepared.Path, prepared.Behind, prepared.Ahead)
+				if err := gitPullRebase(prepared.Path, tok); err != nil {
 					fmt.Printf("    error: %v\n", err)
 					failed++
 					continue
 				}
 			} else {
-				fmt.Printf("  [PULL]  %s: %d behind\n", s.Path, s.Behind)
-				if err := gitPull(s.Path, opts.Sync.GetFFOnly(), tok); err != nil {
+				fmt.Printf("  [PULL]  %s: %d behind\n", prepared.Path, prepared.Behind)
+				if err := gitPull(prepared.Path, opts.Sync.GetFFOnly(), tok); err != nil {
 					fmt.Printf("    error: %v\n", err)
 					failed++
 					continue
 				}
 			}
 		}
-		if s.Ahead > 0 {
-			fmt.Printf("  [PUSH]  %s: %d ahead\n", s.Path, s.Ahead)
-			if err := gitPush(s.Path, tok); err != nil {
+		if prepared.Ahead > 0 {
+			fmt.Printf("  [PUSH]  %s: %d ahead\n", prepared.Path, prepared.Ahead)
+			if err := gitPush(prepared.Path, tok); err != nil {
 				fmt.Printf("    error: %v\n", err)
 				failed++
 				continue

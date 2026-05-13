@@ -104,7 +104,9 @@ tugboat sync             # sync default branches only; skips dirty/local-only fe
 - ff-only pulls by default; diverged branches are rebased (rebase is aborted on conflicts).
 - `pull` and `sync` only manage each repo's default branch.
 - Clean feature branches with no unpushed commits are auto-switched back to the default branch before `pull` or `sync` continues.
-- Dirty repos and feature branches with local-only commits are skipped rather than updated.
+- `pull` and `sync` skip dirty repos before pulling, rebasing, switching branches, or syncing.
+- Feature branches with local-only commits are skipped rather than updated.
+- `push` may still push committed-ahead changes; it is not skipped solely because the worktree is dirty.
 - Repos left on a deleted feature branch are only switched when the branch has no commits outside the default branch.
 - Archived repos flagged; orphans flagged (local but missing remote).
 
@@ -113,3 +115,11 @@ tugboat sync             # sync default branches only; skips dirty/local-only fe
 make build
 go test ./...
 ```
+
+## Release process
+- Update `CHANGELOG.md` for every tagged release.
+- Check whether `README.md` needs user-facing updates before committing a release.
+- Run tests before tagging.
+- Commit all release changes before creating the tag.
+- Create an annotated `v*` tag for the release.
+- Pushing a `v*` tag triggers the release workflow and publishes release artifacts.

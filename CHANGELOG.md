@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.6.2 - 2026-05-13
+- Make the update-safety design explicit: `pull` and `sync` skip dirty repos before pulling, rebasing, switching branches, or syncing.
+- Clarify that `push` can still push committed-ahead changes from a dirty worktree.
+- Document the release process, including the requirement to update this changelog for every tagged release.
+
+## v0.6.1 - 2026-03-29
+- Fall back to a rebase pull when an ff-only pull fails because branches have diverged.
+- Abort failed rebase attempts so repositories are not left mid-rebase.
+
+## v0.6.0 - 2026-03-22
+- Auto-switch repositories off deleted feature branches to the default branch when it is safe.
+
+## v0.5.0 - 2026-03-03
+- Embed HTTPS authentication in Git operations with an ephemeral credential helper.
+
+## v0.4.8 - 2026-02-18
+- Improve clone error messages with a hint about token permissions.
+
+## v0.4.7 - 2026-02-15
+- Fix `pull` failures for repositories left on deleted upstream branches.
+
+## v0.4.6 - 2026-02-12
+- Suppress Git subprocess output unless the command fails.
+
+## v0.4.5 - 2026-01-20
+- Add CI and release workflows for GitHub Actions.
+
 ## v0.4.1 - 2025-12-11
 - Add 0BSD license.
 

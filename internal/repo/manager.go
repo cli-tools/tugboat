@@ -609,13 +609,16 @@ func gitEnvWithAuth(token string) []string {
 	if token == "" {
 		return env
 	}
-	// Use GIT_CONFIG_COUNT/KEY/VALUE to inject an inline credential helper
-	// that echoes the token.  This avoids mutating .git/config.
+	// Clear inherited credential helpers first, then inject an inline helper
+	// that echoes the token. This avoids mutating .git/config and prevents
+	// stale global helpers from winning before Tugboat's token is tried.
 	helper := fmt.Sprintf("!f() { echo username=x-access-token; echo password=%s; }; f", token)
 	env = append(env,
-		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_COUNT=2",
 		"GIT_CONFIG_KEY_0=credential.helper",
-		"GIT_CONFIG_VALUE_0="+helper,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=credential.helper",
+		"GIT_CONFIG_VALUE_1="+helper,
 	)
 	return env
 }

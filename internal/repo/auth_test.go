@@ -9,30 +9,40 @@ import (
 func TestGitEnvWithAuth(t *testing.T) {
 	t.Run("with token sets credential helper", func(t *testing.T) {
 		env := gitEnvWithAuth("mytoken123")
-		var hasPrompt, hasCount, hasKey, hasValue bool
+		var hasPrompt, hasCount, hasClearKey, hasClearValue, hasHelperKey, hasHelperValue bool
 		for _, e := range env {
 			switch {
 			case e == "GIT_TERMINAL_PROMPT=0":
 				hasPrompt = true
-			case e == "GIT_CONFIG_COUNT=1":
+			case e == "GIT_CONFIG_COUNT=2":
 				hasCount = true
 			case e == "GIT_CONFIG_KEY_0=credential.helper":
-				hasKey = true
-			case strings.HasPrefix(e, "GIT_CONFIG_VALUE_0=") && strings.Contains(e, "mytoken123"):
-				hasValue = true
+				hasClearKey = true
+			case e == "GIT_CONFIG_VALUE_0=":
+				hasClearValue = true
+			case e == "GIT_CONFIG_KEY_1=credential.helper":
+				hasHelperKey = true
+			case strings.HasPrefix(e, "GIT_CONFIG_VALUE_1=") && strings.Contains(e, "mytoken123"):
+				hasHelperValue = true
 			}
 		}
 		if !hasPrompt {
 			t.Error("missing GIT_TERMINAL_PROMPT=0")
 		}
 		if !hasCount {
-			t.Error("missing GIT_CONFIG_COUNT=1")
+			t.Error("missing GIT_CONFIG_COUNT=2")
 		}
-		if !hasKey {
+		if !hasClearKey {
 			t.Error("missing GIT_CONFIG_KEY_0=credential.helper")
 		}
-		if !hasValue {
-			t.Error("missing GIT_CONFIG_VALUE_0 with token")
+		if !hasClearValue {
+			t.Error("missing empty GIT_CONFIG_VALUE_0")
+		}
+		if !hasHelperKey {
+			t.Error("missing GIT_CONFIG_KEY_1=credential.helper")
+		}
+		if !hasHelperValue {
+			t.Error("missing GIT_CONFIG_VALUE_1 with token")
 		}
 	})
 

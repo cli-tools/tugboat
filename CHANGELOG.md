@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.6.3 - 2026-06-03
+- Clear inherited Git credential helpers before injecting Tugboat's ephemeral HTTPS token helper, so stale global helpers cannot override the configured provider token.
+
 ## v0.6.2 - 2026-05-13
 - Make the update-safety design explicit: `pull` and `sync` skip dirty repos before pulling, rebasing, switching branches, or syncing.
 - Clarify that `push` can still push committed-ahead changes from a dirty worktree.

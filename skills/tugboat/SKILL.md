@@ -33,11 +33,12 @@ A **foldout** is a repo cloned *inside* another repo, managed via `.tugboat.json
 
 ```bash
 tugboat clone [targets...]    # Clone repos (honors foldouts for repo targets)
-tugboat status [targets...]   # Show dirty/ahead/behind/archived/orphan
-tugboat pull [targets...]     # Fast-forward only pulls
+tugboat status [targets...]   # Show empty/dirty/ahead/behind/archived/orphan
+tugboat pull [targets...]     # Update default branches safely
 tugboat push [targets...]     # Push repos that are ahead
-tugboat sync [targets...]     # Pull then push (ff-only, skips dirty)
+tugboat sync [targets...]     # Pull then push default branches safely
 tugboat list [targets...]     # List local vs remote repos
+tugboat migrate               # Migrate a v1 config to v2
 tugboat help                  # Show help
 tugboat version               # Show version
 ```
@@ -160,21 +161,24 @@ This means:
 ## Status Output
 
 ```
-/root/rideshare (master) [dirty]
-/root/rideshare/api (main) [clean]
-/root/rideshare/batch (master) [3 ahead, 2 behind, diverged]
-/root/rideshare/web (master) [archived]
+  [CLEAN]  /root/rideshare
+  /root/rideshare/api (main) [empty]
+  /root/rideshare/batch (master) [dirty, 3 ahead, 2 behind, diverged]
+  /root/rideshare/web (master) [archived]
 
-Summary: 10 clean, 2 dirty, 1 ahead, 3 behind, 1 diverged, 0 errors
+Summary: 10 clean, 1 empty, 1 dirty, 1 ahead, 1 behind, 1 diverged, 0 errors
 ```
 
 Status flags:
+- `[empty]` - Neither the local clone nor origin has a commit
 - `[dirty]` - Uncommitted changes
 - `[N ahead]` - Local commits not pushed
 - `[N behind]` - Remote commits not pulled
 - `[diverged]` - Both ahead and behind
 - `[archived]` - Repo archived on remote
 - `[orphan]` - Local repo, missing on remote
+
+Empty repositories are valid. `pull`, `push`, and `sync` skip a repository when neither side has a commit. If the first commit appears on origin, `pull` or `sync` initializes the local branch; if it appears locally, `push` or `sync` creates the remote branch.
 
 ## Examples
 
@@ -187,7 +191,7 @@ tugboat clone myteam rideshare  # Specific targets
 ### Daily workflow
 ```bash
 tugboat status    # See what needs attention
-tugboat pull      # Get latest (ff-only)
+tugboat pull      # Safely update default branches
 # ... do work ...
 tugboat push      # Push your commits
 ```
@@ -205,8 +209,11 @@ tugboat list -a           # Include archived
 
 ## Safety Features
 
-- **ff-only pulls**: Never creates merge commits automatically
-- **Dirty skip**: Sync skips repos with uncommitted changes
+- **Default-branch updates**: Pull and sync update default branches, switching away from clean, fully pushed feature branches when safe
+- **ff-only first**: Pulls start ff-only; diverged branches fall back to a merge-preserving rebase and abort cleanly on conflicts
+- **Dirty skip**: Pull and sync skip repos with uncommitted changes before switching, pulling, rebasing, or syncing
+- **Local-commit protection**: Feature branches with local-only commits are not switched or updated
+- **Empty-repo support**: Repositories with no commits are reported and skipped without errors
 - **No force push**: Never force pushes
 - **Archived flagging**: Warns about archived repos
 - **Orphan detection**: Flags local repos missing from remote

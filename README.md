@@ -9,7 +9,8 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-curl -L https://github.com/cli-tools/tugboat/releases/download/v0.4.5/tugboat-v0.4.5-linux-amd64 -o tugboat
+VERSION=v0.6.4
+curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
 ```
@@ -68,7 +69,7 @@ tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
 
 6) Daily
 ```bash
-tugboat status           # shows dirty/ahead/behind + archived/orphan flags
+tugboat status           # shows empty/dirty/ahead/behind + archived/orphan flags
 tugboat pull             # update default branches only; skips dirty/local-only feature branches
 tugboat push             # push ahead repos
 tugboat sync             # sync default branches only; skips dirty/local-only feature branches
@@ -76,7 +77,7 @@ tugboat sync             # sync default branches only; skips dirty/local-only fe
 
 ## Commands
 - `clone [target ...]`   — org targets clone all repos; repo targets honor foldouts
-- `status [target ...]`  — reports state; shows archived/orphan via provider metadata
+- `status [target ...]`  — reports empty/dirty/ahead/behind state; shows archived/orphan via provider metadata
 - `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
 - `push [target ...]`
 - `sync [target ...]`    — syncs default branches only; clean fully-pushed feature branches auto-switch back first
@@ -108,7 +109,25 @@ tugboat sync             # sync default branches only; skips dirty/local-only fe
 - Feature branches with local-only commits are skipped rather than updated.
 - `push` may still push committed-ahead changes; it is not skipped solely because the worktree is dirty.
 - Repos left on a deleted feature branch are only switched when the branch has no commits outside the default branch.
+- Repos with no commits locally or on origin are reported as empty and safely skipped by `pull`, `push`, and `sync`.
+- When an empty repo gets its first commit, Tugboat can pull it from origin or push it from the local clone normally.
 - Archived repos flagged; orphans flagged (local but missing remote).
+
+## Agent skill
+
+The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
+
+For Codex, install the skill matching the v0.6.4 binary with:
+
+```bash
+SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
+SKILL_VERSION=v0.6.4
+mkdir -p "$SKILLS_DIR/tugboat"
+curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
+  -o "$SKILLS_DIR/tugboat/SKILL.md"
+```
+
+For other Agent Skills-compatible tools, use the tool's configured skills directory instead.
 
 ## Build & Test
 ```bash

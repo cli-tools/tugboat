@@ -35,6 +35,9 @@ type RepoStatus struct {
 	Name           string
 	Branch         string
 	DefaultBranch  string
+	Unborn         bool
+	RemoteEmpty    bool
+	LocalCommits   int
 	Dirty          bool
 	Ahead          int
 	Behind         int
@@ -427,7 +430,7 @@ func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
 		return err
 	}
 
-	var clean, dirty, ahead, behind, diverged, errored int
+	var clean, empty, dirty, ahead, behind, diverged, errored int
 	for _, s := range statuses {
 		if s.Error != "" {
 			fmt.Printf("  [ERROR]    %s: %s\n", s.Path, s.Error)
@@ -436,6 +439,10 @@ func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
 		}
 
 		var flags []string
+		if s.Unborn && s.RemoteEmpty {
+			flags = append(flags, "empty")
+			empty++
+		}
 		if s.Dirty {
 			flags = append(flags, "dirty")
 			dirty++
@@ -469,8 +476,8 @@ func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
 		}
 	}
 
-	fmt.Printf("\nSummary: %d clean, %d dirty, %d ahead, %d behind, %d diverged, %d errors\n",
-		clean, dirty, ahead, behind, diverged, errored)
+	fmt.Printf("\nSummary: %d clean, %d empty, %d dirty, %d ahead, %d behind, %d diverged, %d errors\n",
+		clean, empty, dirty, ahead, behind, diverged, errored)
 
 	if debug && len(timings) > 0 {
 		totalTime := time.Duration(0)
@@ -631,6 +638,21 @@ func isGitRepo(path string) bool {
 	return err == nil && info.IsDir()
 }
 
+// getCurrentBranch returns the checked-out branch, including for an unborn
+// branch that does not have a commit yet. Detached HEADs retain the historical
+// "HEAD" result from rev-parse.
+func getCurrentBranch(repoPath string) (string, error) {
+	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	if err == nil {
+		return strings.TrimSpace(branch), nil
+	}
+	branch, symbolicErr := gitOutput(repoPath, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if symbolicErr != nil {
+		return "", err
+	}
+	return strings.TrimSpace(branch), nil
+}
+
 func getRepoStatus(path, target, org, name, provider, token string, timing *RepoTiming) RepoStatus {
 	totalStart := time.Now()
 	status := RepoStatus{
@@ -643,7 +665,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 
 	// Get current branch
 	branchStart := time.Now()
-	branch, err := gitOutput(path, "rev-parse", "--abbrev-ref", "HEAD")
+	branch, err := getCurrentBranch(path)
 	if timing != nil {
 		timing.Branch = time.Since(branchStart)
 	}
@@ -651,7 +673,8 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 		status.Error = fmt.Sprintf("getting branch: %v", err)
 		return status
 	}
-	status.Branch = strings.TrimSpace(branch)
+	status.Branch = branch
+	status.Unborn = gitRun(path, "rev-parse", "--verify", "--quiet", "HEAD") != nil
 
 	// Fetch from remote
 	fetchStart := time.Now()
@@ -660,6 +683,9 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	}
 	if timing != nil {
 		timing.Fetch = time.Since(fetchStart)
+	}
+	if status.Unborn && status.RemoteError == "" && !originHasBranches(path) {
+		status.RemoteEmpty = true
 	}
 
 	// Check for uncommitted changes
@@ -677,19 +703,32 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	// Get ahead/behind counts
 	revListStart := time.Now()
 	upstream := fmt.Sprintf("origin/%s", status.Branch)
-	revList, err := gitOutput(path, "rev-list", "--left-right", "--count", fmt.Sprintf("%s...%s", status.Branch, upstream))
+	var revList string
+	if status.Unborn {
+		if remoteTrackingRefExists(path, status.Branch) {
+			revList, err = gitOutput(path, "rev-list", "--count", upstream)
+			if err == nil {
+				fmt.Sscanf(strings.TrimSpace(revList), "%d", &status.Behind)
+			}
+		}
+	} else {
+		revList, err = gitOutput(path, "rev-list", "--left-right", "--count", fmt.Sprintf("%s...%s", status.Branch, upstream))
+		if err == nil {
+			parts := strings.Fields(strings.TrimSpace(revList))
+			if len(parts) == 2 {
+				fmt.Sscanf(parts[0], "%d", &status.Ahead)
+				fmt.Sscanf(parts[1], "%d", &status.Behind)
+			}
+		} else if status.RemoteError == "" {
+			// rev-list failed after a successful fetch — the upstream ref is gone.
+			status.UpstreamGone = true
+			if count, countErr := gitOutput(path, "rev-list", "--count", status.Branch); countErr == nil {
+				fmt.Sscanf(strings.TrimSpace(count), "%d", &status.LocalCommits)
+			}
+		}
+	}
 	if timing != nil {
 		timing.RevList = time.Since(revListStart)
-	}
-	if err == nil {
-		parts := strings.Fields(strings.TrimSpace(revList))
-		if len(parts) == 2 {
-			fmt.Sscanf(parts[0], "%d", &status.Ahead)
-			fmt.Sscanf(parts[1], "%d", &status.Behind)
-		}
-	} else if status.RemoteError == "" {
-		// rev-list failed after a successful fetch — the upstream ref is gone.
-		status.UpstreamGone = true
 	}
 
 	mergeBaseStart := time.Now()
@@ -827,11 +866,10 @@ func gitPush(repoPath, token string) error {
 // Returns an error if fetch fails, so callers can distinguish "verified missing"
 // from "could not verify".
 func hasUpstreamRef(repoPath, token string) (bool, string, error) {
-	branch, err := gitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	branch, err := getCurrentBranch(repoPath)
 	if err != nil {
 		return false, "", fmt.Errorf("getting branch: %w", err)
 	}
-	branch = strings.TrimSpace(branch)
 	// Fetch with auth so HTTPS repos can authenticate.
 	cmd := exec.Command("git", "fetch", "--quiet")
 	cmd.Dir = repoPath
@@ -869,6 +907,11 @@ func localBranchExists(repoPath, branch string) bool {
 
 func remoteTrackingRefExists(repoPath, branch string) bool {
 	return gitRun(repoPath, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch) == nil
+}
+
+func originHasBranches(repoPath string) bool {
+	refs, err := gitOutput(repoPath, "for-each-ref", "--format=%(refname)", "refs/remotes/origin")
+	return err == nil && strings.TrimSpace(refs) != ""
 }
 
 func branchHasCommitsOutsideDefaultBranch(repoPath, branch, defaultBranch string) (bool, error) {
@@ -962,6 +1005,16 @@ func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.R
 		if r, ok := repos[statuses[i].Name]; ok {
 			statuses[i].Archived = r.Archived
 			statuses[i].DefaultBranch = r.DefaultBranch
+			statuses[i].RemoteEmpty = r.Empty
+			if r.Empty {
+				statuses[i].Behind = 0
+				statuses[i].UpstreamGone = false
+				if statuses[i].Unborn {
+					statuses[i].Ahead = 0
+				} else if statuses[i].LocalCommits > 0 {
+					statuses[i].Ahead = statuses[i].LocalCommits
+				}
+			}
 		} else {
 			statuses[i].Orphan = true
 		}
@@ -990,6 +1043,16 @@ func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoS
 	if s.Dirty {
 		return s, false, &updateSkipError{reason: fmt.Sprintf("on %s, dirty; not updating non-default branch", s.Branch)}
 	}
+	if s.Unborn {
+		if err := ensureLocalBranch(s.Path, defaultBranch); err != nil {
+			return s, false, err
+		}
+		refreshed := getRepoStatus(s.Path, s.Target, s.Org, s.Name, s.Provider, token, nil)
+		refreshed.DefaultBranch = defaultBranch
+		refreshed.Archived = s.Archived
+		refreshed.Orphan = s.Orphan
+		return refreshed, true, nil
+	}
 	if s.Ahead > 0 {
 		return s, false, &updateSkipError{reason: fmt.Sprintf("on %s, %d ahead; not updating non-default branch", s.Branch, s.Ahead)}
 	}
@@ -1003,6 +1066,10 @@ func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoS
 	refreshed.Archived = s.Archived
 	refreshed.Orphan = s.Orphan
 	return refreshed, true, nil
+}
+
+func isEmptyRepository(s RepoStatus) bool {
+	return s.Unborn && s.RemoteEmpty
 }
 
 // TODO: implement sync/pull/push/list using the new target model.
@@ -1043,6 +1110,15 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		if s.Error != "" {
 			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
 			failed++
+			continue
+		}
+		if s.RemoteEmpty {
+			reason := "origin has no commits"
+			if s.Unborn {
+				reason = "no commits locally or on origin"
+			}
+			fmt.Printf("  [SKIP]  %s: %s\n", s.Path, reason)
+			skipped++
 			continue
 		}
 
@@ -1114,6 +1190,11 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 			failed++
 			continue
 		}
+		if isEmptyRepository(s) {
+			fmt.Printf("  [SKIP]  %s: no commits locally or on origin\n", s.Path)
+			skipped++
+			continue
+		}
 		if s.Behind > 0 {
 			fmt.Printf("  [SKIP]  %s: behind remote, pull first\n", s.Path)
 			skipped++
@@ -1160,6 +1241,11 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 		if s.Error != "" {
 			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
 			failed++
+			continue
+		}
+		if isEmptyRepository(s) {
+			fmt.Printf("  [SKIP]  %s: no commits locally or on origin\n", s.Path)
+			skipped++
 			continue
 		}
 		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)

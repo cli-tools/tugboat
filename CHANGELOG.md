@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.4 - 2026-07-13
+- Support repositories with no commits without reporting a branch-detection error.
+- Report empty repositories explicitly and skip pull, push, and sync when neither the local clone nor origin has commits.
+- Handle the first commit appearing locally or on origin so it can be pushed or pulled normally.
+
 ## v0.6.3 - 2026-06-03
 - Clear inherited Git credential helpers before injecting Tugboat's ephemeral HTTPS token helper, so stale global helpers cannot override the configured provider token.
 

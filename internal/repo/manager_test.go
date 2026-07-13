@@ -40,6 +40,120 @@ type testRepo struct {
 	defaultBranch string
 	remotePath    string
 	workPath      string
+	empty         bool
+}
+
+func TestGetCurrentBranchSupportsUnbornAndDetachedHEAD(t *testing.T) {
+	base := t.TempDir()
+	emptyRepo := createEmptyTestRepo(t, base, "acme", "empty", "main", filepath.Join(base, "empty-work"))
+
+	branch, err := getCurrentBranch(emptyRepo.workPath)
+	if err != nil {
+		t.Fatalf("getCurrentBranch() on unborn branch error = %v", err)
+	}
+	if branch != "main" {
+		t.Fatalf("getCurrentBranch() on unborn branch = %q, want %q", branch, "main")
+	}
+
+	repo := createTestRepo(t, base, "acme", "app", "main", filepath.Join(base, "app-work"))
+	runGit(t, repo.workPath, "switch", "--detach")
+	branch, err = getCurrentBranch(repo.workPath)
+	if err != nil {
+		t.Fatalf("getCurrentBranch() on detached HEAD error = %v", err)
+	}
+	if branch != "HEAD" {
+		t.Fatalf("getCurrentBranch() on detached HEAD = %q, want %q", branch, "HEAD")
+	}
+}
+
+func TestEmptyRepositoryIsReportedAndSkipped(t *testing.T) {
+	base := t.TempDir()
+	repo := createEmptyTestRepo(t, base, "acme", "empty", "main", filepath.Join(base, "empty-work"))
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	statusOutput := captureStdout(t, func() {
+		if err := manager.Status(nil, false, 1); err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+	})
+	if strings.Contains(statusOutput, "[ERROR]") {
+		t.Fatalf("unexpected status error for empty repository:\n%s", statusOutput)
+	}
+	if !strings.Contains(statusOutput, repo.workPath+" (main) [empty]") {
+		t.Fatalf("expected empty status, got:\n%s", statusOutput)
+	}
+	if !strings.Contains(statusOutput, "Summary: 0 clean, 1 empty") {
+		t.Fatalf("expected empty summary count, got:\n%s", statusOutput)
+	}
+
+	commands := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Pull", run: func() error { return manager.Pull(nil, 1) }},
+		{name: "Push", run: func() error { return manager.Push(nil, 1) }},
+		{name: "Sync", run: func() error { return manager.Sync(nil, 1) }},
+	}
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			output := captureStdout(t, func() {
+				if err := command.run(); err != nil {
+					t.Fatalf("%s() error = %v", command.name, err)
+				}
+			})
+			if !strings.Contains(output, "[SKIP]  "+repo.workPath+": no commits locally or on origin") {
+				t.Fatalf("expected empty repository skip, got:\n%s", output)
+			}
+			if !strings.Contains(output, "0 failed") {
+				t.Fatalf("expected no failures, got:\n%s", output)
+			}
+		})
+	}
+}
+
+func TestSyncPullsFirstRemoteCommitIntoUnbornRepository(t *testing.T) {
+	base := t.TempDir()
+	repo := createEmptyTestRepo(t, base, "acme", "empty", "main", filepath.Join(base, "empty-work"))
+	seed := cloneRepo(t, repo.remotePath, filepath.Join(base, "seed"))
+	commitFile(t, seed, "README.md", "first\n", "first commit")
+	runGit(t, seed, "push", "origin", "main")
+	repo.empty = false
+
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+	output := captureStdout(t, func() {
+		if err := manager.Sync(nil, 1); err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "[PULL]  "+repo.workPath+": 1 behind") {
+		t.Fatalf("expected initial remote commit to be pulled, got:\n%s", output)
+	}
+	if data, err := os.ReadFile(filepath.Join(repo.workPath, "README.md")); err != nil || string(data) != "first\n" {
+		t.Fatalf("README.md after sync = %q, %v; want %q", string(data), err, "first\\n")
+	}
+}
+
+func TestPushSendsFirstLocalCommitToEmptyRemote(t *testing.T) {
+	base := t.TempDir()
+	repo := createEmptyTestRepo(t, base, "acme", "empty", "main", filepath.Join(base, "empty-work"))
+	commitFile(t, repo.workPath, "README.md", "first\n", "first commit")
+
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+	output := captureStdout(t, func() {
+		if err := manager.Push(nil, 1); err != nil {
+			t.Fatalf("Push() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "[PUSH]  "+repo.workPath+": 1 commits") {
+		t.Fatalf("expected initial local commit to be pushed, got:\n%s", output)
+	}
+	localHead := strings.TrimSpace(runGit(t, repo.workPath, "rev-parse", "HEAD"))
+	remoteHead := strings.TrimSpace(runGit(t, repo.remotePath, "rev-parse", "refs/heads/main"))
+	if localHead != remoteHead {
+		t.Fatalf("remote HEAD = %q, want local HEAD %q", remoteHead, localHead)
+	}
 }
 
 func TestPullSwitchesCleanPushedFeatureBranchToDefault(t *testing.T) {
@@ -375,6 +489,23 @@ func remoteRepo(repo testRepo) remote.Repository {
 		Name:          repo.name,
 		FullName:      repo.org + "/" + repo.name,
 		DefaultBranch: repo.defaultBranch,
+		Empty:         repo.empty,
+	}
+}
+
+func createEmptyTestRepo(t *testing.T, baseDir, org, name, defaultBranch, workPath string) testRepo {
+	t.Helper()
+	remotePath := filepath.Join(baseDir, name+"-remote.git")
+	runGit(t, baseDir, "init", "--bare", remotePath)
+	runGit(t, remotePath, "symbolic-ref", "HEAD", "refs/heads/"+defaultBranch)
+	workPath = cloneRepo(t, remotePath, workPath)
+	return testRepo{
+		org:           org,
+		name:          name,
+		defaultBranch: defaultBranch,
+		remotePath:    remotePath,
+		workPath:      workPath,
+		empty:         true,
 	}
 }
 

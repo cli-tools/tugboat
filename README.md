@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.6.4
+VERSION=v0.7.0
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -70,17 +70,19 @@ tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
 6) Daily
 ```bash
 tugboat status           # shows empty/dirty/ahead/behind + archived/orphan flags
+tugboat status --all     # also list every clean repository
 tugboat pull             # update default branches only; skips dirty/local-only feature branches
 tugboat push             # push ahead repos
 tugboat sync             # sync default branches only; skips dirty/local-only feature branches
+tugboat sync --remove-archived  # safely remove archived local checkouts
 ```
 
 ## Commands
 - `clone [target ...]`   — org targets clone all repos; repo targets honor foldouts
-- `status [target ...]`  — reports empty/dirty/ahead/behind state; shows archived/orphan via provider metadata
+- `status [target ...]`  — groups archived/attention/missing/empty state by target; `--all` expands clean rows
 - `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
 - `push [target ...]`
-- `sync [target ...]`    — syncs default branches only; clean fully-pushed feature branches auto-switch back first
+- `sync [target ...]`    — syncs default branches only; `--remove-archived` removes verified-safe archived checkouts
 - `list [target ...]`    — shows local + remote; flags archived/orphan
 - `help`, `version`
 
@@ -111,17 +113,20 @@ tugboat sync             # sync default branches only; skips dirty/local-only fe
 - Repos left on a deleted feature branch are only switched when the branch has no commits outside the default branch.
 - Repos with no commits locally or on origin are reported as empty and safely skipped by `pull`, `push`, and `sync`.
 - When an empty repo gets its first commit, Tugboat can pull it from origin or push it from the local clone normally.
-- Archived repos flagged; orphans flagged (local but missing remote).
+- Archived repos are flagged and skipped by `pull`, `push`, and normal `sync`; orphans are flagged as local but missing remote.
+- `sync --remove-archived` permanently removes an archived checkout only after confirming its provider identity, origin URL, clean worktree, upstream default branch, and absence of local-only commits, stashes, linked worktrees, active Git operations, or remaining nested checkouts.
+- Behind archived default branches are fast-forwarded before removal. Diverged repositories and repositories containing local work are retained. Ignored files are considered disposable and are removed with an otherwise-safe checkout.
+- Explicit repo and foldout declarations remain in configuration after cleanup; later status runs report those checkouts as missing rather than treating them as errors.
 
 ## Agent skill
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.6.4 binary with:
+For Codex, install the skill matching the v0.7.0 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.6.4
+SKILL_VERSION=v0.7.0
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

@@ -33,10 +33,12 @@ A **foldout** is a repo cloned *inside* another repo, managed via `.tugboat.json
 
 ```bash
 tugboat clone [targets...]    # Clone repos (honors foldouts for repo targets)
-tugboat status [targets...]   # Show empty/dirty/ahead/behind/archived/orphan
+tugboat status [targets...]   # Show grouped empty/dirty/ahead/behind/archived/orphan
+tugboat status --all          # Expand clean repository rows
 tugboat pull [targets...]     # Update default branches safely
 tugboat push [targets...]     # Push repos that are ahead
 tugboat sync [targets...]     # Pull then push default branches safely
+tugboat sync --remove-archived [targets...]  # Remove verified-safe archived checkouts
 tugboat list [targets...]     # List local vs remote repos
 tugboat migrate               # Migrate a v1 config to v2
 tugboat help                  # Show help
@@ -46,6 +48,8 @@ tugboat version               # Show version
 ### Options
 - `-w, --workers N` - Parallel workers (default: CPU cores)
 - `-d, --debug` - Show timing info (status only)
+- `--all` - Include clean repository rows (status only)
+- `--remove-archived` - Permanently remove safe archived checkouts (sync only)
 - `-E, --exclude-empty` - Skip empty repos (clone only)
 - `-a, --include-archived` - Include archived repos
 
@@ -161,22 +165,23 @@ This means:
 ## Status Output
 
 ```
-  [CLEAN]  /root/rideshare
-  /root/rideshare/api (main) [empty]
-  /root/rideshare/batch (master) [dirty, 3 ahead, 2 behind, diverged]
-  /root/rideshare/web (master) [archived]
+Target: rideshare  /root/rideshare
 
-Summary: 10 clean, 1 empty, 1 dirty, 1 ahead, 1 behind, 1 diverged, 0 errors
+Archived (1)
+  ARCHIVED  web    master
+
+Attention (1)
+  DIVERGED  batch  master  dirty, 3 ahead, 2 behind
+
+Empty (1)
+  EMPTY     api    main
+
+Clean (10 hidden; use --all)
+
+Summary: 13 repositories: 10 clean, 1 empty, 1 dirty, 1 ahead, 1 behind, 1 diverged, 1 archived, 0 orphan, 0 missing, 0 errors
 ```
 
-Status flags:
-- `[empty]` - Neither the local clone nor origin has a commit
-- `[dirty]` - Uncommitted changes
-- `[N ahead]` - Local commits not pushed
-- `[N behind]` - Remote commits not pulled
-- `[diverged]` - Both ahead and behind
-- `[archived]` - Repo archived on remote
-- `[orphan]` - Local repo, missing on remote
+Status is grouped by target and uses paths relative to the target root. Archived repositories remain in the Archived group even when details such as `dirty` or `2 ahead` block cleanup. Use `--all` to expand the Clean group. Configured repo targets and foldouts that are absent locally are reported as missing.
 
 Empty repositories are valid. `pull`, `push`, and `sync` skip a repository when neither side has a commit. If the first commit appears on origin, `pull` or `sync` initializes the local branch; if it appears locally, `push` or `sync` creates the remote branch.
 
@@ -199,6 +204,7 @@ tugboat push      # Push your commits
 ### Sync all repos
 ```bash
 tugboat sync      # Pull then push, skips dirty repos
+tugboat sync --remove-archived  # Fast-forward and remove safe archived checkouts
 ```
 
 ### Check what's remote vs local
@@ -215,5 +221,6 @@ tugboat list -a           # Include archived
 - **Local-commit protection**: Feature branches with local-only commits are not switched or updated
 - **Empty-repo support**: Repositories with no commits are reported and skipped without errors
 - **No force push**: Never force pushes
-- **Archived flagging**: Warns about archived repos
+- **Archived handling**: Pull, push, and normal sync skip archived repos
+- **Safe archive cleanup**: `sync --remove-archived` confirms archive metadata and origin identity, fast-forwards only, and refuses dirty worktrees, local-only commits or stashes, active operations, linked worktrees, and remaining nested checkouts. Ignored files are disposable.
 - **Orphan detection**: Flags local repos missing from remote

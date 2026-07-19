@@ -47,6 +47,31 @@ func resolveWorkers(cliWorkers int, cfg *config.Config) int {
 	return cfg.Workers // 0 means pool.Run will use GOMAXPROCS
 }
 
+func parseSyncArgs(args []string) (removeArchived bool, targetNames []string) {
+	for _, arg := range args {
+		if arg == "--remove-archived" {
+			removeArchived = true
+			continue
+		}
+		targetNames = append(targetNames, arg)
+	}
+	return removeArchived, targetNames
+}
+
+func parseStatusArgs(args []string) (debug, showAll bool, targetNames []string) {
+	for _, arg := range args {
+		switch arg {
+		case "--debug", "-d":
+			debug = true
+		case "--all":
+			showAll = true
+		default:
+			targetNames = append(targetNames, arg)
+		}
+	}
+	return debug, showAll, targetNames
+}
+
 var version = "dev"
 
 func main() {
@@ -90,8 +115,8 @@ Usage: tugboat <command> [options]
 
 Commands:
   clone, c      Clone targets (org or repo); -E/--exclude-empty, -a/--include-archived
-  sync, s       Sync targets (ff-only)
-  status, st    Show status for targets (foldouts included)
+  sync, s       Sync targets; --remove-archived safely removes archived checkouts
+  status, st    Show grouped status; --all includes clean repository rows
   list, ls      List targets (local vs remote); -a/--include-archived
   pull          Update targets on their default branch (ff-only)
   push          Push targets
@@ -124,7 +149,9 @@ Configuration:
 Examples:
   tugboat clone          # Clone all repos from configured orgs
   tugboat sync           # Sync default branches safely
+  tugboat sync --remove-archived  # Remove archived checkouts that pass every safety check
   tugboat status         # Show which repos have changes
+  tugboat status --all   # Include clean repository rows
   tugboat status -w 16   # Use 16 parallel workers
   tugboat list           # List all managed repos
 `
@@ -176,6 +203,7 @@ func runSync(args []string) {
 
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
+	removeArchived, targetNames := parseSyncArgs(args)
 
 	clients, err := cfg.BuildRemoteClients()
 	if err != nil {
@@ -184,7 +212,7 @@ func runSync(args []string) {
 	}
 	manager := repo.NewManager(clients, cfg)
 
-	if err := manager.Sync(args, workers); err != nil {
+	if err := manager.Sync(targetNames, repo.SyncOptions{RemoveArchived: removeArchived, Workers: workers}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error syncing repositories: %v\n", err)
 		os.Exit(1)
 	}
@@ -199,16 +227,7 @@ func runStatus(args []string) {
 
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
-	debug := false
-	var targetNames []string
-	for _, arg := range args {
-		switch arg {
-		case "--debug", "-d":
-			debug = true
-		default:
-			targetNames = append(targetNames, arg)
-		}
-	}
+	debug, showAll, targetNames := parseStatusArgs(args)
 
 	clients, err := cfg.BuildRemoteClients()
 	if err != nil {
@@ -217,7 +236,7 @@ func runStatus(args []string) {
 	}
 	manager := repo.NewManager(clients, cfg)
 
-	if err := manager.Status(targetNames, debug, workers); err != nil {
+	if err := manager.Status(targetNames, repo.StatusOptions{Debug: debug, ShowAll: showAll, Workers: workers}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error showing status: %v\n", err)
 		os.Exit(1)
 	}

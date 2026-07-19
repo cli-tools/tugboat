@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -13,10 +14,15 @@ import (
 )
 
 type fakeClient struct {
-	repos map[string]map[string]remote.Repository
+	repos   map[string]map[string]remote.Repository
+	listErr map[string]error
+	getErr  map[string]error
 }
 
 func (c fakeClient) ListOrgRepos(orgName string) ([]remote.Repository, error) {
+	if err := c.listErr[orgName]; err != nil {
+		return nil, err
+	}
 	reposByName := c.repos[orgName]
 	repos := make([]remote.Repository, 0, len(reposByName))
 	for _, repo := range reposByName {
@@ -26,6 +32,9 @@ func (c fakeClient) ListOrgRepos(orgName string) ([]remote.Repository, error) {
 }
 
 func (c fakeClient) GetRepo(owner, repoName string) (*remote.Repository, error) {
+	if err := c.getErr[owner+"/"+repoName]; err != nil {
+		return nil, err
+	}
 	repo, ok := c.repos[owner][repoName]
 	if !ok {
 		return nil, nil
@@ -41,6 +50,7 @@ type testRepo struct {
 	remotePath    string
 	workPath      string
 	empty         bool
+	archived      bool
 }
 
 func TestGetCurrentBranchSupportsUnbornAndDetachedHEAD(t *testing.T) {
@@ -72,17 +82,17 @@ func TestEmptyRepositoryIsReportedAndSkipped(t *testing.T) {
 	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
 
 	statusOutput := captureStdout(t, func() {
-		if err := manager.Status(nil, false, 1); err != nil {
+		if err := manager.Status(nil, StatusOptions{Workers: 1}); err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
 	})
 	if strings.Contains(statusOutput, "[ERROR]") {
 		t.Fatalf("unexpected status error for empty repository:\n%s", statusOutput)
 	}
-	if !strings.Contains(statusOutput, repo.workPath+" (main) [empty]") {
+	if !strings.Contains(statusOutput, "Empty (1)") || !strings.Contains(statusOutput, "EMPTY  .  main") {
 		t.Fatalf("expected empty status, got:\n%s", statusOutput)
 	}
-	if !strings.Contains(statusOutput, "Summary: 0 clean, 1 empty") {
+	if !strings.Contains(statusOutput, "Summary: 1 repository: 0 clean, 1 empty") {
 		t.Fatalf("expected empty summary count, got:\n%s", statusOutput)
 	}
 
@@ -92,7 +102,7 @@ func TestEmptyRepositoryIsReportedAndSkipped(t *testing.T) {
 	}{
 		{name: "Pull", run: func() error { return manager.Pull(nil, 1) }},
 		{name: "Push", run: func() error { return manager.Push(nil, 1) }},
-		{name: "Sync", run: func() error { return manager.Sync(nil, 1) }},
+		{name: "Sync", run: func() error { return manager.Sync(nil, SyncOptions{Workers: 1}) }},
 	}
 	for _, command := range commands {
 		t.Run(command.name, func(t *testing.T) {
@@ -121,7 +131,7 @@ func TestSyncPullsFirstRemoteCommitIntoUnbornRepository(t *testing.T) {
 
 	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
 	output := captureStdout(t, func() {
-		if err := manager.Sync(nil, 1); err != nil {
+		if err := manager.Sync(nil, SyncOptions{Workers: 1}); err != nil {
 			t.Fatalf("Sync() error = %v", err)
 		}
 	})
@@ -260,7 +270,7 @@ func TestSyncSwitchesThenPullsDefaultBranch(t *testing.T) {
 
 	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
 	output := captureStdout(t, func() {
-		if err := manager.Sync(nil, 1); err != nil {
+		if err := manager.Sync(nil, SyncOptions{Workers: 1}); err != nil {
 			t.Fatalf("Sync() error = %v", err)
 		}
 	})
@@ -449,6 +459,381 @@ func TestPullSkipsMissingRepoTargetPathButContinues(t *testing.T) {
 	}
 }
 
+func TestStatusGroupsRepositoriesAndCollapsesCleanRows(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "target")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	archived := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(root, "archived"))
+	archived.archived = true
+	writeFile(t, filepath.Join(archived.workPath, "archived-local.txt"), "local\n")
+	dirty := createTestRepo(t, base, "acme", "dirty", "main", filepath.Join(root, "dirty"))
+	writeFile(t, filepath.Join(dirty.workPath, "local.txt"), "local\n")
+	clean := createTestRepo(t, base, "acme", "clean", "main", filepath.Join(root, "clean"))
+
+	target := config.Target{Name: "target", Provider: "fake", Org: "acme", Path: root}
+	manager := newTestManager([]config.Target{target}, fakeClientForRepos(archived, dirty, clean))
+	output := captureStdout(t, func() {
+		if err := manager.Status(nil, StatusOptions{Workers: 1}); err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+	})
+
+	archivedAt := strings.Index(output, "Archived (1)")
+	attentionAt := strings.Index(output, "Attention (1)")
+	cleanAt := strings.Index(output, "Clean (1 hidden; use --all)")
+	if archivedAt < 0 || attentionAt < archivedAt || cleanAt < attentionAt {
+		t.Fatalf("status groups are missing or out of order:\n%s", output)
+	}
+	if !strings.Contains(output, "ARCHIVED  archived  main  dirty") || !strings.Contains(output, "DIRTY  dirty  main") {
+		t.Fatalf("expected aligned relative-path rows, got:\n%s", output)
+	}
+	if strings.Contains(output, "CLEAN  clean") {
+		t.Fatalf("clean row should be hidden by default:\n%s", output)
+	}
+
+	allOutput := captureStdout(t, func() {
+		if err := manager.Status(nil, StatusOptions{ShowAll: true, Workers: 1}); err != nil {
+			t.Fatalf("Status(--all) error = %v", err)
+		}
+	})
+	if !strings.Contains(allOutput, "Clean (1)") || !strings.Contains(allOutput, "CLEAN  clean  main") {
+		t.Fatalf("expected expanded clean group, got:\n%s", allOutput)
+	}
+}
+
+func TestStatusReportsMissingConfiguredArchivedRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	if err := os.RemoveAll(repo.workPath); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	output := captureStdout(t, func() {
+		if err := manager.Status(nil, StatusOptions{Workers: 1}); err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "Archived (1)") || !strings.Contains(output, "ARCHIVED  .  main  missing") {
+		t.Fatalf("expected missing archived status, got:\n%s", output)
+	}
+	if !strings.Contains(output, "1 archived, 0 orphan, 1 missing") {
+		t.Fatalf("expected archived and missing summary counts, got:\n%s", output)
+	}
+}
+
+func TestStatusReportsMissingConfiguredActiveRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "active", "main", filepath.Join(base, "work"))
+	if err := os.RemoveAll(repo.workPath); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	output := captureStdout(t, func() {
+		if err := manager.Status(nil, StatusOptions{Workers: 1}); err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "Missing (1)") || !strings.Contains(output, "MISSING  .  main") {
+		t.Fatalf("expected non-error missing status, got:\n%s", output)
+	}
+	if strings.Contains(output, "ERROR") {
+		t.Fatalf("missing configured checkout should not be an error:\n%s", output)
+	}
+}
+
+func TestUpdateCommandsSkipArchivedRepoWithoutRemovalFlag(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	commands := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "pull", run: func() error { return manager.Pull(nil, 1) }},
+		{name: "push", run: func() error { return manager.Push(nil, 1) }},
+		{name: "sync", run: func() error { return manager.Sync(nil, SyncOptions{Workers: 1}) }},
+	}
+	for _, command := range commands {
+		output := captureStdout(t, func() {
+			if err := command.run(); err != nil {
+				t.Fatalf("%s error = %v", command.name, err)
+			}
+		})
+		if !strings.Contains(output, "[SKIP]  "+repo.workPath+": archived") {
+			t.Fatalf("expected archived skip from %s, got:\n%s", command.name, output)
+		}
+	}
+	if !isGitRepo(repo.workPath) {
+		t.Fatal("archived repository was removed without --remove-archived")
+	}
+}
+
+func TestSyncRemovesCleanArchivedRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	output := captureStdout(t, func() {
+		if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+	})
+	if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
+		t.Fatalf("archived checkout still exists: %v", err)
+	}
+	if !strings.Contains(output, "[REMOVE] "+repo.workPath) || !strings.Contains(output, "1 removed") {
+		t.Fatalf("expected removal output, got:\n%s", output)
+	}
+}
+
+func TestSyncRemovesEmptyArchivedRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := createEmptyTestRepo(t, base, "acme", "empty", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
+		t.Fatalf("empty archived checkout still exists: %v", err)
+	}
+}
+
+func TestSyncFastForwardsThenRemovesArchivedRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	other := cloneRepo(t, repo.remotePath, filepath.Join(base, "other"))
+	commitFile(t, other, "remote.txt", "remote\n", "remote update")
+	runGit(t, other, "push", "origin", "main")
+	repo.archived = true
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	output := captureStdout(t, func() {
+		if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "[PULL]  "+repo.workPath+": fast-forwarded archived default branch") {
+		t.Fatalf("expected archived fast-forward, got:\n%s", output)
+	}
+	if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
+		t.Fatalf("archived checkout still exists: %v", err)
+	}
+}
+
+func TestSyncRemovesArchivedRepoFromFullyPushedFeatureBranch(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	runGit(t, repo.workPath, "switch", "-c", "feature/pushed")
+	commitFile(t, repo.workPath, "feature.txt", "pushed\n", "pushed feature")
+	runGit(t, repo.workPath, "push", "-u", "origin", "feature/pushed")
+	repo.archived = true
+	manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+	if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
+		t.Fatalf("archived checkout still exists: %v", err)
+	}
+}
+
+func TestArchivedRemovalAllowsIgnoredFilesButRejectsDirtyWork(t *testing.T) {
+	t.Run("ignored files are disposable", func(t *testing.T) {
+		base := t.TempDir()
+		repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+		commitFile(t, repo.workPath, ".gitignore", "cache/\n", "ignore cache")
+		runGit(t, repo.workPath, "push", "origin", "main")
+		writeFile(t, filepath.Join(repo.workPath, "cache", "artifact.bin"), "ignored\n")
+		repo.archived = true
+		manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+		if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+		if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
+			t.Fatalf("checkout containing only ignored data still exists: %v", err)
+		}
+	})
+
+	t.Run("untracked files block removal", func(t *testing.T) {
+		base := t.TempDir()
+		repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+		writeFile(t, filepath.Join(repo.workPath, "local.txt"), "local\n")
+		repo.archived = true
+		manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+		output := captureStdout(t, func() {
+			if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+				t.Fatalf("safety skip should not fail Sync(): %v", err)
+			}
+		})
+		if !strings.Contains(output, "archived, dirty worktree") || !isGitRepo(repo.workPath) {
+			t.Fatalf("expected dirty checkout to be retained, got:\n%s", output)
+		}
+	})
+}
+
+func TestArchivedRemovalProtectsHiddenGitWork(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(t *testing.T, repo testRepo, base string)
+		wantReason string
+	}{
+		{
+			name: "other branch commit",
+			prepare: func(t *testing.T, repo testRepo, _ string) {
+				runGit(t, repo.workPath, "switch", "-c", "local-work")
+				commitFile(t, repo.workPath, "local.txt", "local\n", "local work")
+				runGit(t, repo.workPath, "switch", "main")
+			},
+			wantReason: "local-only commits",
+		},
+		{
+			name: "stash",
+			prepare: func(t *testing.T, repo testRepo, _ string) {
+				writeFile(t, filepath.Join(repo.workPath, "README.md"), "stashed\n")
+				runGit(t, repo.workPath, "stash", "push", "-m", "saved work")
+			},
+			wantReason: "local-only commits",
+		},
+		{
+			name: "local tag commit",
+			prepare: func(t *testing.T, repo testRepo, _ string) {
+				runGit(t, repo.workPath, "switch", "-c", "tagged-work")
+				commitFile(t, repo.workPath, "tagged.txt", "tagged\n", "tagged work")
+				runGit(t, repo.workPath, "tag", "local-only")
+				runGit(t, repo.workPath, "switch", "main")
+				runGit(t, repo.workPath, "branch", "-D", "tagged-work")
+			},
+			wantReason: "local-only commits",
+		},
+		{
+			name: "active operation",
+			prepare: func(t *testing.T, repo testRepo, _ string) {
+				writeFile(t, filepath.Join(repo.workPath, ".git", "BISECT_LOG"), "# active bisect\n")
+			},
+			wantReason: "active Git operation",
+		},
+		{
+			name: "linked worktree",
+			prepare: func(t *testing.T, repo testRepo, base string) {
+				runGit(t, repo.workPath, "worktree", "add", "-b", "linked", filepath.Join(base, "linked"))
+			},
+			wantReason: "linked worktrees",
+		},
+		{
+			name: "nested checkout",
+			prepare: func(t *testing.T, repo testRepo, _ string) {
+				writeFile(t, filepath.Join(repo.workPath, ".git", "info", "exclude"), "nested/\n")
+				nested := filepath.Join(repo.workPath, "nested")
+				if err := os.MkdirAll(nested, 0755); err != nil {
+					t.Fatal(err)
+				}
+				runGit(t, nested, "init")
+			},
+			wantReason: "nested Git checkout",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+			test.prepare(t, repo, base)
+			repo.archived = true
+			manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+
+			output := captureStdout(t, func() {
+				if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+					t.Fatalf("safety skip should not fail Sync(): %v", err)
+				}
+			})
+			if !strings.Contains(output, test.wantReason) || !isGitRepo(repo.workPath) {
+				t.Fatalf("expected checkout to be retained for %s, got:\n%s", test.wantReason, output)
+			}
+		})
+	}
+}
+
+func TestArchivedRemovalProcessesFoldoutsBeforeParent(t *testing.T) {
+	base := t.TempDir()
+	parent := createTestRepo(t, base, "parentorg", "parent", "main", filepath.Join(base, "parent-work"))
+	child := createTestRepo(t, base, "childorg", "child", "main", filepath.Join(parent.workPath, "child"))
+	writeFile(t, filepath.Join(parent.workPath, ".gitignore"), "child/\n")
+	writeFile(t, filepath.Join(parent.workPath, ".tugboat.json"), "{\n  \"repos\": [{\"name\": \"childorg/child\", \"target\": \"child\"}]\n}\n")
+	runGit(t, parent.workPath, "add", ".gitignore", ".tugboat.json")
+	runGit(t, parent.workPath, "commit", "-m", "add foldout")
+	runGit(t, parent.workPath, "push", "origin", "main")
+	parent.archived = true
+	child.archived = true
+
+	target := repoTarget(parent)
+	manager := newTestManager([]config.Target{target}, fakeClientForRepos(parent, child))
+	output := captureStdout(t, func() {
+		if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+	})
+	if _, err := os.Stat(parent.workPath); !os.IsNotExist(err) {
+		t.Fatalf("parent checkout still exists: %v\n%s", err, output)
+	}
+	if strings.Count(output, "[REMOVE]") != 2 {
+		t.Fatalf("expected parent and child removal, got:\n%s", output)
+	}
+}
+
+func TestArchivedRemovalOriginMismatchIsOperationalError(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	client := fakeClientForRepos(repo)
+	remoteRepo := client.repos[repo.org][repo.name]
+	remoteRepo.CloneURL = filepath.Join(base, "different.git")
+	client.repos[repo.org][repo.name] = remoteRepo
+	manager := newTestManager([]config.Target{repoTarget(repo)}, client)
+
+	var syncErr error
+	output := captureStdout(t, func() {
+		syncErr = manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1})
+	})
+	if syncErr == nil || !strings.Contains(output, "does not match provider repository") {
+		t.Fatalf("expected origin mismatch error, err=%v output:\n%s", syncErr, output)
+	}
+	if !isGitRepo(repo.workPath) {
+		t.Fatal("origin-mismatched checkout was removed")
+	}
+}
+
+func TestArchivedRemovalProviderFailureIsOperationalError(t *testing.T) {
+	base := t.TempDir()
+	repo := createTestRepo(t, base, "acme", "archived", "main", filepath.Join(base, "work"))
+	repo.archived = true
+	client := fakeClientForRepos(repo)
+	client.listErr = map[string]error{"acme": errors.New("provider unavailable")}
+	manager := newTestManager([]config.Target{repoTarget(repo)}, client)
+
+	var syncErr error
+	output := captureStdout(t, func() {
+		syncErr = manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1})
+	})
+	if syncErr == nil || !strings.Contains(output, "provider unavailable") {
+		t.Fatalf("expected provider metadata error, err=%v output:\n%s", syncErr, output)
+	}
+	if !isGitRepo(repo.workPath) {
+		t.Fatal("checkout was removed without confirmed archive metadata")
+	}
+}
+
 func newTestManager(targets []config.Target, client fakeClient) *Manager {
 	cfg := &config.Config{
 		Providers: map[string]config.Provider{
@@ -488,8 +873,10 @@ func remoteRepo(repo testRepo) remote.Repository {
 	return remote.Repository{
 		Name:          repo.name,
 		FullName:      repo.org + "/" + repo.name,
+		CloneURL:      repo.remotePath,
 		DefaultBranch: repo.defaultBranch,
 		Empty:         repo.empty,
+		Archived:      repo.archived,
 	}
 }
 

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
@@ -45,8 +47,21 @@ type RepoStatus struct {
 	UpstreamGone   bool
 	Archived       bool
 	Orphan         bool
+	Missing        bool
 	RemoteError    string
+	MetadataError  string
 	Error          string
+}
+
+type StatusOptions struct {
+	Debug   bool
+	ShowAll bool
+	Workers int
+}
+
+type SyncOptions struct {
+	RemoveArchived bool
+	Workers        int
 }
 
 type foldoutRepo struct {
@@ -106,25 +121,30 @@ func (m *Manager) targetsFor(names []string) ([]config.Target, error) {
 }
 
 // buildRepoIndex fetches remote repo metadata for the requested orgs (per provider).
-// Key is provider|org, value is map[name]Repository.
-func (m *Manager) buildRepoIndex(orgs []orgKey) (map[string]map[string]remote.Repository, error) {
+// Keys are provider|org. Errors are retained per organization so callers can
+// fail closed without losing metadata that was fetched successfully elsewhere.
+func (m *Manager) buildRepoIndex(orgs []orgKey) (map[string]map[string]remote.Repository, map[string]error) {
 	index := make(map[string]map[string]remote.Repository)
+	errorsByOrg := make(map[string]error)
 	for _, k := range orgs {
+		key := k.string()
 		client, ok := m.providers[k.provider]
 		if !ok {
-			return nil, fmt.Errorf("no client for provider %s", k.provider)
+			errorsByOrg[key] = fmt.Errorf("no client for provider %s", k.provider)
+			continue
 		}
 		repos, err := client.ListOrgRepos(k.org)
 		if err != nil {
-			return nil, fmt.Errorf("listing repos for %s/%s: %w", k.provider, k.org, err)
+			errorsByOrg[key] = fmt.Errorf("listing repos for %s/%s: %w", k.provider, k.org, err)
+			continue
 		}
-		m := make(map[string]remote.Repository, len(repos))
+		reposByName := make(map[string]remote.Repository, len(repos))
 		for _, r := range repos {
-			m[r.Name] = r
+			reposByName[r.Name] = r
 		}
-		index[k.string()] = m
+		index[key] = reposByName
 	}
-	return index, nil
+	return index, errorsByOrg
 }
 
 // ------------ foldout --------------
@@ -413,6 +433,7 @@ type statusJob struct {
 	org      string
 	provider string
 	token    string
+	missing  bool
 }
 
 type statusResult struct {
@@ -420,66 +441,81 @@ type statusResult struct {
 	timing RepoTiming
 }
 
-func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
+type statusGroup int
+
+const (
+	groupArchived statusGroup = iota
+	groupAttention
+	groupMissing
+	groupEmpty
+	groupClean
+)
+
+func (m *Manager) Status(targetNames []string, opts StatusOptions) error {
 	targets, err := m.targetsFor(targetNames)
 	if err != nil {
 		return err
 	}
-	statuses, timings, err := m.getAllStatuses(targets, debug, workers)
+	statuses, timings, err := m.getAllStatuses(targets, opts.Debug, opts.Workers)
 	if err != nil {
 		return err
 	}
 
-	var clean, empty, dirty, ahead, behind, diverged, errored int
+	byTarget := make(map[string][]RepoStatus, len(targets))
+	var clean, empty, dirty, ahead, behind, diverged, archived, orphan, missing, errored int
 	for _, s := range statuses {
-		if s.Error != "" {
-			fmt.Printf("  [ERROR]    %s: %s\n", s.Path, s.Error)
+		byTarget[s.Target] = append(byTarget[s.Target], s)
+		if hasStatusError(s) {
 			errored++
-			continue
 		}
-
-		var flags []string
-		if s.Unborn && s.RemoteEmpty {
-			flags = append(flags, "empty")
+		if isEmptyRepository(s) {
 			empty++
 		}
 		if s.Dirty {
-			flags = append(flags, "dirty")
 			dirty++
 		}
 		if s.Ahead > 0 {
-			flags = append(flags, fmt.Sprintf("%d ahead", s.Ahead))
 			ahead++
 		}
 		if s.Behind > 0 {
-			flags = append(flags, fmt.Sprintf("%d behind", s.Behind))
 			behind++
 			if !s.CanFastForward {
-				flags = append(flags, "diverged")
 				diverged++
 			}
 		}
-		if s.RemoteError != "" {
-			flags = append(flags, "remote: "+s.RemoteError)
-		}
 		if s.Archived {
-			flags = append(flags, "archived")
+			archived++
 		}
 		if s.Orphan {
-			flags = append(flags, "orphan")
+			orphan++
 		}
-		if len(flags) > 0 {
-			fmt.Printf("  %s (%s) [%s]\n", s.Path, s.Branch, strings.Join(flags, ", "))
-		} else {
-			fmt.Printf("  [CLEAN]  %s\n", s.Path)
+		if s.Missing {
+			missing++
+		}
+		if statusGroupFor(s) == groupClean {
 			clean++
 		}
 	}
 
-	fmt.Printf("\nSummary: %d clean, %d empty, %d dirty, %d ahead, %d behind, %d diverged, %d errors\n",
-		clean, empty, dirty, ahead, behind, diverged, errored)
+	for _, target := range targets {
+		fmt.Printf("Target: %s  %s\n\n", target.Name, target.Path)
+		targetStatuses := byTarget[target.Name]
+		if len(targetStatuses) == 0 {
+			fmt.Println("No repositories found.")
+			fmt.Println()
+			continue
+		}
+		renderStatusGroups(target, targetStatuses, opts.ShowAll)
+	}
 
-	if debug && len(timings) > 0 {
+	repositoryWord := "repositories"
+	if len(statuses) == 1 {
+		repositoryWord = "repository"
+	}
+	fmt.Printf("Summary: %d %s: %d clean, %d empty, %d dirty, %d ahead, %d behind, %d diverged, %d archived, %d orphan, %d missing, %d errors\n",
+		len(statuses), repositoryWord, clean, empty, dirty, ahead, behind, diverged, archived, orphan, missing, errored)
+
+	if opts.Debug && len(timings) > 0 {
 		totalTime := time.Duration(0)
 		for _, t := range timings {
 			totalTime += t.Total
@@ -487,6 +523,163 @@ func (m *Manager) Status(targetNames []string, debug bool, workers int) error {
 		fmt.Printf("\nDebug: %d repos, total time %v\n", len(timings), totalTime)
 	}
 	return nil
+}
+
+func hasStatusError(s RepoStatus) bool {
+	return s.Error != "" || s.RemoteError != "" || s.MetadataError != ""
+}
+
+func statusErrorMessage(s RepoStatus) string {
+	var messages []string
+	if s.Error != "" {
+		messages = append(messages, s.Error)
+	}
+	if s.MetadataError != "" {
+		messages = append(messages, "provider: "+s.MetadataError)
+	}
+	if s.RemoteError != "" {
+		messages = append(messages, "remote: "+s.RemoteError)
+	}
+	return strings.Join(messages, "; ")
+}
+
+func statusGroupFor(s RepoStatus) statusGroup {
+	if s.Archived {
+		return groupArchived
+	}
+	if hasStatusError(s) || s.Orphan || s.Dirty || s.Ahead > 0 || s.Behind > 0 {
+		return groupAttention
+	}
+	if s.Missing {
+		return groupMissing
+	}
+	if isEmptyRepository(s) {
+		return groupEmpty
+	}
+	return groupClean
+}
+
+func primaryStatus(s RepoStatus) string {
+	if s.Archived {
+		return "ARCHIVED"
+	}
+	if hasStatusError(s) {
+		return "ERROR"
+	}
+	if s.Orphan {
+		return "ORPHAN"
+	}
+	if s.Behind > 0 && !s.CanFastForward {
+		return "DIVERGED"
+	}
+	if s.Dirty {
+		return "DIRTY"
+	}
+	if s.Behind > 0 {
+		return "BEHIND"
+	}
+	if s.Ahead > 0 {
+		return "AHEAD"
+	}
+	if s.Missing {
+		return "MISSING"
+	}
+	if isEmptyRepository(s) {
+		return "EMPTY"
+	}
+	return "CLEAN"
+}
+
+func statusDetails(s RepoStatus, state string) string {
+	var details []string
+	if s.Error != "" {
+		details = append(details, s.Error)
+	}
+	if s.MetadataError != "" {
+		details = append(details, "provider: "+s.MetadataError)
+	}
+	if s.RemoteError != "" {
+		details = append(details, "remote: "+s.RemoteError)
+	}
+	if s.Orphan && state != "ORPHAN" {
+		details = append(details, "orphan")
+	}
+	if s.Missing && state != "MISSING" {
+		details = append(details, "missing")
+	}
+	if isEmptyRepository(s) && state != "EMPTY" {
+		details = append(details, "empty")
+	}
+	if s.Dirty && state != "DIRTY" {
+		details = append(details, "dirty")
+	}
+	if s.Ahead > 0 {
+		details = append(details, fmt.Sprintf("%d ahead", s.Ahead))
+	}
+	if s.Behind > 0 {
+		details = append(details, fmt.Sprintf("%d behind", s.Behind))
+	}
+	if s.Behind > 0 && !s.CanFastForward && state != "DIVERGED" {
+		details = append(details, "diverged")
+	}
+	return strings.Join(details, ", ")
+}
+
+func renderStatusGroups(target config.Target, statuses []RepoStatus, showAll bool) {
+	groups := []struct {
+		kind  statusGroup
+		title string
+	}{
+		{groupArchived, "Archived"},
+		{groupAttention, "Attention"},
+		{groupMissing, "Missing"},
+		{groupEmpty, "Empty"},
+		{groupClean, "Clean"},
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	for _, group := range groups {
+		var rows []RepoStatus
+		for _, s := range statuses {
+			if statusGroupFor(s) == group.kind {
+				rows = append(rows, s)
+			}
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			return rows[i].Path < rows[j].Path
+		})
+		if group.kind == groupClean && !showAll {
+			fmt.Fprintf(w, "Clean (%d hidden; use --all)\n\n", len(rows))
+			continue
+		}
+
+		fmt.Fprintf(w, "%s (%d)\n", group.title, len(rows))
+		for _, s := range rows {
+			relativePath, err := filepath.Rel(target.Path, s.Path)
+			if err != nil || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+				relativePath = s.Path
+			}
+			branch := s.Branch
+			if branch == "" {
+				branch = s.DefaultBranch
+			}
+			if branch == "" {
+				branch = "-"
+			}
+			state := primaryStatus(s)
+			details := statusDetails(s, state)
+			if details == "" {
+				fmt.Fprintf(w, "  %s\t%s\t%s\n", state, relativePath, branch)
+			} else {
+				fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", state, relativePath, branch, details)
+			}
+		}
+		fmt.Fprintln(w)
+	}
+	w.Flush()
 }
 
 func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers int) ([]RepoStatus, []RepoTiming, error) {
@@ -520,28 +713,24 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 				orgKeySet[okey.string()] = true
 			}
 		} else {
-			if _, err := os.Stat(t.Path); os.IsNotExist(err) {
-				return nil, nil, fmt.Errorf("target %q path does not exist: %s", t.Name, t.Path)
-			}
-			if isGitRepo(t.Path) {
-				jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider, token: tok})
-			}
+			parentExists := isGitRepo(t.Path)
+			jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider, token: tok, missing: !parentExists})
 			// foldout
-			fc, err := loadFoldout(t.Path)
-			if err != nil {
-				return nil, nil, err
-			}
-			if fc != nil {
-				for _, fr := range fc.Repos {
-					dest := filepath.Join(t.Path, fr.Target)
-					if isGitRepo(dest) {
+			if parentExists {
+				fc, err := loadFoldout(t.Path)
+				if err != nil {
+					return nil, nil, err
+				}
+				if fc != nil {
+					for _, fr := range fc.Repos {
+						dest := filepath.Join(t.Path, fr.Target)
 						parts := strings.Split(fr.Name, "/")
 						repoName := parts[len(parts)-1]
 						frOrg := t.Org
 						if len(parts) == 2 {
 							frOrg = parts[0]
 						}
-						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok})
+						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok, missing: !isGitRepo(dest)})
 						okey := orgKey{provider: t.Provider, org: frOrg}
 						if !orgKeySet[okey.string()] {
 							orgKeys = append(orgKeys, okey)
@@ -565,6 +754,12 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 
 	results := pool.Run(jobs, workers, func(job statusJob) statusResult {
 		var timing RepoTiming
+		if job.missing {
+			return statusResult{status: RepoStatus{
+				Path: job.path, Target: job.target, Provider: job.provider,
+				Org: job.org, Name: job.name, Missing: true,
+			}}
+		}
 		status := getRepoStatus(job.path, job.target, job.org, job.name, job.provider, job.token, &timing)
 		return statusResult{status: status, timing: timing}
 	})
@@ -576,11 +771,10 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 		timings[i] = r.timing
 	}
 
-	// mark archived/orphan
+	// Mark archived/orphan and retain provider failures on every affected repo.
 	if len(orgKeys) > 0 {
-		if index, err := m.buildRepoIndex(orgKeys); err == nil {
-			markRemoteState(statuses, index)
-		}
+		index, metadataErrors := m.buildRepoIndex(orgKeys)
+		markRemoteState(statuses, index, metadataErrors)
 	}
 
 	sort.Slice(statuses, func(i, j int) bool {
@@ -994,12 +1188,16 @@ func switchToDefaultBranch(repoPath, branch, defaultBranch string) error {
 }
 
 // markRemoteState annotates archived/orphan based on remote index.
-func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.Repository) {
+func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.Repository, metadataErrors map[string]error) {
 	for i := range statuses {
 		key := orgKey{provider: statuses[i].Provider, org: statuses[i].Org}.string()
+		if err, ok := metadataErrors[key]; ok {
+			statuses[i].MetadataError = err.Error()
+			continue
+		}
 		repos, ok := index[key]
 		if !ok {
-			statuses[i].Orphan = true
+			statuses[i].MetadataError = "repository metadata unavailable"
 			continue
 		}
 		if r, ok := repos[statuses[i].Name]; ok {
@@ -1015,7 +1213,7 @@ func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.R
 					statuses[i].Ahead = statuses[i].LocalCommits
 				}
 			}
-		} else {
+		} else if !statuses[i].Missing {
 			statuses[i].Orphan = true
 		}
 	}
@@ -1072,6 +1270,397 @@ func isEmptyRepository(s RepoStatus) bool {
 	return s.Unborn && s.RemoteEmpty
 }
 
+type archiveSkipError struct {
+	reason string
+}
+
+func (e *archiveSkipError) Error() string { return e.reason }
+
+func archiveSkip(reason string) error {
+	return &archiveSkipError{reason: reason}
+}
+
+func gitOutputWithAuth(repoPath, token string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvWithAuth(token)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message != "" {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, message)
+		}
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return string(output), nil
+}
+
+func normalizeGitRemoteURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	// SCP-like SSH URLs (git@example.com:org/repo.git) are not parsed as
+	// hierarchical URLs by net/url.
+	if !strings.Contains(raw, "://") {
+		if colon := strings.Index(raw, ":"); colon > 0 && strings.Contains(raw[:colon], "@") {
+			host := raw[:colon]
+			if at := strings.LastIndex(host, "@"); at >= 0 {
+				host = host[at+1:]
+			}
+			path := strings.TrimSuffix(strings.TrimPrefix(raw[colon+1:], "/"), ".git")
+			return strings.ToLower(host) + "/" + path
+		}
+		if absolute, err := filepath.Abs(raw); err == nil {
+			return filepath.Clean(absolute)
+		}
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if parsed.Scheme == "file" {
+		return filepath.Clean(parsed.Path)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if parsed.Port() != "" {
+		host += ":" + parsed.Port()
+	}
+	path := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), ".git")
+	if host == "" {
+		return filepath.Clean(parsed.Path)
+	}
+	return host + "/" + path
+}
+
+func validateArchiveRemovalPath(candidate string, target config.Target) error {
+	candidateAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return fmt.Errorf("resolving checkout path: %w", err)
+	}
+	rootAbs, err := filepath.Abs(target.Path)
+	if err != nil {
+		return fmt.Errorf("resolving target path: %w", err)
+	}
+	if candidateAbs == filepath.VolumeName(candidateAbs)+string(filepath.Separator) {
+		return fmt.Errorf("refusing to remove filesystem root %s", candidateAbs)
+	}
+
+	info, err := os.Lstat(candidateAbs)
+	if err != nil {
+		return fmt.Errorf("inspecting checkout path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("checkout path is not a real directory: %s", candidateAbs)
+	}
+	candidateReal, err := filepath.EvalSymlinks(candidateAbs)
+	if err != nil {
+		return fmt.Errorf("resolving checkout symlinks: %w", err)
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return fmt.Errorf("resolving target symlinks: %w", err)
+	}
+	relative, err := filepath.Rel(rootReal, candidateReal)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("checkout %s is outside target %s", candidateAbs, rootAbs)
+	}
+	if target.Repo == "" && relative == "." {
+		return fmt.Errorf("refusing to remove organization target root %s", rootAbs)
+	}
+	if !isGitRepo(candidateAbs) {
+		return fmt.Errorf("checkout is not a standard Git repository: %s", candidateAbs)
+	}
+	return nil
+}
+
+func verifyOriginMatches(repoPath string, repository *remote.Repository) error {
+	origin, err := gitOutput(repoPath, "remote", "get-url", "origin")
+	if err != nil {
+		return fmt.Errorf("reading origin URL: %w", err)
+	}
+	actual := normalizeGitRemoteURL(origin)
+	expectedURLs := []string{repository.CloneURL, repository.SSHURL, repository.HTMLURL}
+	for _, expectedURL := range expectedURLs {
+		expected := normalizeGitRemoteURL(expectedURL)
+		if expected != "" && strings.EqualFold(actual, expected) {
+			return nil
+		}
+	}
+	return fmt.Errorf("origin %q does not match provider repository %s", strings.TrimSpace(origin), repository.FullName)
+}
+
+func (m *Manager) confirmArchivedRepository(s RepoStatus) (*remote.Repository, error) {
+	client, ok := m.providers[s.Provider]
+	if !ok {
+		return nil, fmt.Errorf("no client for provider %s", s.Provider)
+	}
+	repository, err := client.GetRepo(s.Org, s.Name)
+	if err != nil {
+		return nil, fmt.Errorf("checking archive state for %s/%s: %w", s.Org, s.Name, err)
+	}
+	if repository == nil {
+		return nil, fmt.Errorf("provider repository %s/%s no longer exists", s.Org, s.Name)
+	}
+	if repository.FullName != "" && !strings.EqualFold(repository.FullName, s.Org+"/"+s.Name) {
+		return nil, fmt.Errorf("provider returned unexpected repository %s", repository.FullName)
+	}
+	if !repository.Archived {
+		return nil, archiveSkip("repository is no longer archived")
+	}
+	return repository, nil
+}
+
+func refreshArchiveRemote(repoPath, token string) ([]string, error) {
+	if _, err := gitOutputWithAuth(repoPath, token, "fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+		return nil, err
+	}
+	if _, err := gitOutputWithAuth(repoPath, token, "fetch", "--quiet", "--tags", "origin"); err != nil {
+		return nil, err
+	}
+	output, err := gitOutputWithAuth(repoPath, token, "ls-remote", "--heads", "--tags", "origin")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var objectIDs []string
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || seen[fields[0]] {
+			continue
+		}
+		seen[fields[0]] = true
+		objectIDs = append(objectIDs, fields[0])
+	}
+	return objectIDs, nil
+}
+
+func localOnlyCommitCount(repoPath string, remoteObjectIDs []string) (int, error) {
+	args := []string{"rev-list", "--all", "--stdin"}
+	if gitRun(repoPath, "rev-parse", "--verify", "--quiet", "HEAD") == nil {
+		args = append(args, "HEAD")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoPath
+	cmd.Env = gitEnvNoPrompt()
+	var exclusions strings.Builder
+	for _, objectID := range remoteObjectIDs {
+		fmt.Fprintf(&exclusions, "^%s\n", objectID)
+	}
+	cmd.Stdin = strings.NewReader(exclusions.String())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("checking local-only commits: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return 0, nil
+	}
+	return len(strings.Split(trimmed, "\n")), nil
+}
+
+func activeGitOperation(repoPath string) (string, error) {
+	markers := []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-apply", "rebase-merge", "sequencer"}
+	for _, marker := range markers {
+		gitPath, err := gitOutput(repoPath, "rev-parse", "--git-path", marker)
+		if err != nil {
+			return "", fmt.Errorf("resolving Git operation marker %s: %w", marker, err)
+		}
+		gitPath = strings.TrimSpace(gitPath)
+		if !filepath.IsAbs(gitPath) {
+			gitPath = filepath.Join(repoPath, gitPath)
+		}
+		if _, err := os.Stat(gitPath); err == nil {
+			return marker, nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("inspecting Git operation marker %s: %w", marker, err)
+		}
+	}
+	return "", nil
+}
+
+func hasLinkedWorktree(repoPath string) (bool, error) {
+	output, err := gitOutput(repoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("listing linked worktrees: %w", err)
+	}
+	count := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			count++
+		}
+	}
+	return count > 1, nil
+}
+
+func nestedGitCheckout(repoPath string) (string, error) {
+	rootGit := filepath.Join(repoPath, ".git")
+	var nested string
+	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == rootGit {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path != repoPath && entry.Name() == ".git" {
+			nested = filepath.Dir(path)
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+		}
+		return nil
+	})
+	return nested, err
+}
+
+func verifyArchivedLocalState(repoPath string, remoteObjectIDs []string) error {
+	dirty, err := gitOutput(repoPath, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
+	if err != nil {
+		return fmt.Errorf("checking worktree status: %w", err)
+	}
+	if strings.TrimSpace(dirty) != "" {
+		return archiveSkip("dirty worktree")
+	}
+	if operation, err := activeGitOperation(repoPath); err != nil {
+		return err
+	} else if operation != "" {
+		return archiveSkip("active Git operation: " + operation)
+	}
+	if linked, err := hasLinkedWorktree(repoPath); err != nil {
+		return err
+	} else if linked {
+		return archiveSkip("has linked worktrees")
+	}
+	if nested, err := nestedGitCheckout(repoPath); err != nil {
+		return fmt.Errorf("checking nested repositories: %w", err)
+	} else if nested != "" {
+		return archiveSkip("contains nested Git checkout " + nested)
+	}
+	localOnly, err := localOnlyCommitCount(repoPath, remoteObjectIDs)
+	if err != nil {
+		return err
+	}
+	if localOnly > 0 {
+		return archiveSkip(fmt.Sprintf("contains %d local-only commits", localOnly))
+	}
+	return nil
+}
+
+func fastForwardArchivedDefault(repoPath, defaultBranch string, remoteEmpty bool, token string) (bool, error) {
+	if remoteEmpty {
+		return false, nil
+	}
+	defaultBranch = strings.TrimSpace(defaultBranch)
+	if defaultBranch == "" {
+		resolved, err := defaultBranchFromOriginHead(repoPath)
+		if err != nil {
+			return false, err
+		}
+		defaultBranch = resolved
+	}
+	if !remoteTrackingRefExists(repoPath, defaultBranch) {
+		return false, fmt.Errorf("default branch %q is unavailable on origin", defaultBranch)
+	}
+
+	branch, err := getCurrentBranch(repoPath)
+	if err != nil {
+		return false, fmt.Errorf("getting current branch: %w", err)
+	}
+	if branch != defaultBranch {
+		if err := switchToDefaultBranch(repoPath, branch, defaultBranch); err != nil {
+			var skipErr *updateSkipError
+			if errors.As(err, &skipErr) {
+				return false, archiveSkip(skipErr.reason)
+			}
+			return false, err
+		}
+	}
+
+	localHead, localErr := gitOutput(repoPath, "rev-parse", "--verify", "HEAD")
+	remoteHead, err := gitOutput(repoPath, "rev-parse", "--verify", "origin/"+defaultBranch)
+	if err != nil {
+		return false, fmt.Errorf("reading origin/%s: %w", defaultBranch, err)
+	}
+	if localErr == nil && strings.TrimSpace(localHead) == strings.TrimSpace(remoteHead) {
+		return false, nil
+	}
+
+	var output string
+	if localErr != nil {
+		cmd := exec.Command("git", "pull", "--ff-only", "origin", defaultBranch)
+		cmd.Dir = repoPath
+		cmd.Env = gitEnvWithAuth(token)
+		combined, pullErr := cmd.CombinedOutput()
+		output, err = string(combined), pullErr
+	} else {
+		cmd := exec.Command("git", "merge", "--ff-only", "origin/"+defaultBranch)
+		cmd.Dir = repoPath
+		cmd.Env = gitEnvNoPrompt()
+		combined, mergeErr := cmd.CombinedOutput()
+		output, err = string(combined), mergeErr
+	}
+	if err != nil {
+		return false, archiveSkip("default branch cannot be fast-forwarded: " + strings.TrimSpace(output))
+	}
+
+	localHead, err = gitOutput(repoPath, "rev-parse", "--verify", "HEAD")
+	if err != nil || strings.TrimSpace(localHead) != strings.TrimSpace(remoteHead) {
+		return false, fmt.Errorf("default branch did not reach origin/%s", defaultBranch)
+	}
+	return true, nil
+}
+
+func (m *Manager) removeArchivedRepo(s RepoStatus, target config.Target, token string) (bool, error) {
+	if err := validateArchiveRemovalPath(s.Path, target); err != nil {
+		return false, err
+	}
+	repository, err := m.confirmArchivedRepository(s)
+	if err != nil {
+		return false, err
+	}
+	if err := verifyOriginMatches(s.Path, repository); err != nil {
+		return false, err
+	}
+	remoteObjectIDs, err := refreshArchiveRemote(s.Path, token)
+	if err != nil {
+		return false, err
+	}
+	if err := verifyArchivedLocalState(s.Path, remoteObjectIDs); err != nil {
+		return false, err
+	}
+	fastForwarded, err := fastForwardArchivedDefault(s.Path, repository.DefaultBranch, repository.Empty, token)
+	if err != nil {
+		return false, err
+	}
+	if err := verifyArchivedLocalState(s.Path, remoteObjectIDs); err != nil {
+		return false, err
+	}
+
+	repository, err = m.confirmArchivedRepository(s)
+	if err != nil {
+		return false, err
+	}
+	if err := verifyOriginMatches(s.Path, repository); err != nil {
+		return false, err
+	}
+	if err := validateArchiveRemovalPath(s.Path, target); err != nil {
+		return false, err
+	}
+	if err := verifyArchivedLocalState(s.Path, remoteObjectIDs); err != nil {
+		return false, err
+	}
+	if err := os.RemoveAll(s.Path); err != nil {
+		return false, fmt.Errorf("removing checkout: %w", err)
+	}
+	return fastForwarded, nil
+}
+
 // TODO: implement sync/pull/push/list using the new target model.
 func (m *Manager) Pull(targetNames []string, workers int) error {
 	targets, err := m.targetsFor(targetNames)
@@ -1107,9 +1696,14 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
 
-		if s.Error != "" {
-			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
+		if hasStatusError(s) {
+			fmt.Printf("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
 			failed++
+			continue
+		}
+		if s.Archived {
+			fmt.Printf("  [SKIP]  %s: archived\n", s.Path)
+			skipped++
 			continue
 		}
 		if s.RemoteEmpty {
@@ -1137,8 +1731,8 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 		if switched {
 			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
 		}
-		if prepared.Error != "" {
-			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, prepared.Error)
+		if hasStatusError(prepared) {
+			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
 			failed++
 			continue
 		}
@@ -1185,9 +1779,19 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 
 	var pushed, skipped, failed int
 	for _, s := range statuses {
-		if s.Error != "" {
-			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
+		if hasStatusError(s) {
+			fmt.Printf("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
 			failed++
+			continue
+		}
+		if s.Missing {
+			fmt.Printf("  [SKIP]  %s: missing\n", s.Path)
+			skipped++
+			continue
+		}
+		if s.Archived {
+			fmt.Printf("  [SKIP]  %s: archived\n", s.Path)
+			skipped++
 			continue
 		}
 		if isEmptyRepository(s) {
@@ -1215,32 +1819,49 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 	return nil
 }
 
-func (m *Manager) Sync(targetNames []string, workers int) error {
+func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	targets, err := m.targetsFor(targetNames)
 	if err != nil {
 		return err
 	}
-	statuses, _, err := m.getAllStatuses(targets, false, workers)
+	statuses, _, err := m.getAllStatuses(targets, false, runOpts.Workers)
 	if err != nil {
 		return err
 	}
 
-	// map target -> options and tokens
+	// Map target names to provider settings and target boundaries.
 	optMap := make(map[string]config.ProviderOptions)
 	tokenMap := make(map[string]string)
+	targetMap := make(map[string]config.Target)
 	for _, t := range targets {
 		optMap[t.Name] = m.config.Providers[t.Provider].Options
 		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
+		targetMap[t.Name] = t
 	}
 
-	var synced, skipped, failed int
+	var archivedStatuses []RepoStatus
+	var synced, removed, skipped, failed int
 	for _, s := range statuses {
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
 
-		if s.Error != "" {
-			fmt.Printf("  [ERROR] %s: %s\n", s.Path, s.Error)
+		if hasStatusError(s) {
+			fmt.Printf("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
 			failed++
+			continue
+		}
+		if s.Missing {
+			fmt.Printf("  [SKIP]  %s: missing\n", s.Path)
+			skipped++
+			continue
+		}
+		if s.Archived {
+			if runOpts.RemoveArchived {
+				archivedStatuses = append(archivedStatuses, s)
+			} else {
+				fmt.Printf("  [SKIP]  %s: archived\n", s.Path)
+				skipped++
+			}
 			continue
 		}
 		if isEmptyRepository(s) {
@@ -1263,8 +1884,8 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 		if switched {
 			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
 		}
-		if prepared.Error != "" {
-			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, prepared.Error)
+		if hasStatusError(prepared) {
+			fmt.Printf("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
 			failed++
 			continue
 		}
@@ -1301,6 +1922,44 @@ func (m *Manager) Sync(targetNames []string, workers int) error {
 			}
 		}
 		synced++
+	}
+
+	// A parent checkout may contain foldouts. Remove deepest paths first, then
+	// let the nested-repository safety check decide whether a parent can follow.
+	sort.Slice(archivedStatuses, func(i, j int) bool {
+		leftDepth := strings.Count(filepath.Clean(archivedStatuses[i].Path), string(filepath.Separator))
+		rightDepth := strings.Count(filepath.Clean(archivedStatuses[j].Path), string(filepath.Separator))
+		if leftDepth == rightDepth {
+			return archivedStatuses[i].Path < archivedStatuses[j].Path
+		}
+		return leftDepth > rightDepth
+	})
+	for _, s := range archivedStatuses {
+		fastForwarded, err := m.removeArchivedRepo(s, targetMap[s.Target], tokenMap[s.Target])
+		if err != nil {
+			var skipErr *archiveSkipError
+			if errors.As(err, &skipErr) {
+				fmt.Printf("  [SKIP]  %s: archived, %s\n", s.Path, skipErr.reason)
+				skipped++
+				continue
+			}
+			fmt.Printf("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
+			continue
+		}
+		if fastForwarded {
+			fmt.Printf("  [PULL]  %s: fast-forwarded archived default branch\n", s.Path)
+		}
+		fmt.Printf("  [REMOVE] %s: archived checkout removed\n", s.Path)
+		removed++
+	}
+
+	if runOpts.RemoveArchived {
+		fmt.Printf("Sync complete: %d synced, %d removed, %d skipped, %d failed\n", synced, removed, skipped, failed)
+		if failed > 0 {
+			return fmt.Errorf("sync completed with %d operational errors", failed)
+		}
+		return nil
 	}
 	fmt.Printf("Sync complete: %d synced, %d skipped, %d failed\n", synced, skipped, failed)
 	return nil

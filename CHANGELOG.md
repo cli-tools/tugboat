@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.0 - 2026-07-19
+
+- Group status output by target and repository state, use relative paths, collapse clean rows by default, and report archived, orphaned, and missing counts in the summary.
+- Add `status --all` to expand clean repository rows.
+- Add `sync --remove-archived` to permanently remove archived checkouts only after provider, origin, worktree, branch, ref, worktree-link, operation, and nesting safety checks pass.
+- Skip archived repositories during normal pull, push, and sync operations, and report configured checkouts removed by cleanup as missing.
+
 ## v0.6.4 - 2026-07-13
 - Support repositories with no commits without reporting a branch-detection error.
 - Report empty repositories explicitly and skip pull, push, and sync when neither the local clone nor origin has commits.

@@ -779,6 +779,7 @@ func TestArchivedRemovalProcessesFoldoutsBeforeParent(t *testing.T) {
 
 	target := repoTarget(parent)
 	manager := newTestManager([]config.Target{target}, fakeClientForRepos(parent, child))
+	manager.Verbose = true
 	output := captureStdout(t, func() {
 		if err := manager.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
 			t.Fatalf("Sync() error = %v", err)

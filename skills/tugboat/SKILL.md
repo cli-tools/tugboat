@@ -48,6 +48,7 @@ tugboat version               # Show version
 ### Options
 - `-w, --workers N` - Parallel workers (default: CPU cores)
 - `-d, --debug` - Show timing info (status only)
+- `--verbose` - Show detailed check stages and update-start messages (pull, push, sync)
 - `--all` - Include clean repository rows (status only)
 - `--remove-archived` - Permanently remove safe archived checkouts (sync only)
 - `-E, --exclude-empty` - Skip empty repos (clone only)
@@ -104,6 +105,12 @@ tugboat version               # Show version
 ```json
 { "provider": "github", "org": "myorg", "repo": "rideshare", "path": "~/rideshare", "name": "rideshare" }
 ```
+
+### Clone Exclusions
+
+Organization targets can set `"exclude": ["benchmark-runs", "scratch-*"]` to skip matching repositories during `clone`. Patterns match complete repository names case-sensitively using Go's `path.Match` syntax (`*`, `?`, bracket classes, and escaping). An omitted or empty list excludes nothing.
+
+Empty patterns, malformed globs, `/` paths, and leading `!` exceptions fail config loading. Nonempty exclusions on single-repository targets are also errors. Exclusions do not remove existing checkouts or affect other commands, explicit repository targets, or foldouts. No `.tugboatignore` file is read.
 
 ## Foldouts (.tugboat.json)
 

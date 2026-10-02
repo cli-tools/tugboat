@@ -41,11 +41,12 @@ func (s SyncOptions) GetFFOnly() bool {
 // Target is a user-specified checkout target: either an entire org (Repo empty)
 // or a single repo (Org + Repo).
 type Target struct {
-	Name     string `json:"name,omitempty"` // optional CLI name; defaults to Repo or Org
-	Provider string `json:"provider"`
-	Org      string `json:"org"`
-	Repo     string `json:"repo,omitempty"`
-	Path     string `json:"path"`
+	Name     string   `json:"name,omitempty"` // optional CLI name; defaults to Repo or Org
+	Provider string   `json:"provider"`
+	Org      string   `json:"org"`
+	Repo     string   `json:"repo,omitempty"`
+	Path     string   `json:"path"`
+	Exclude  []string `json:"exclude,omitempty"` // repository name globs for organization clones
 }
 
 // Config holds the tugboat configuration

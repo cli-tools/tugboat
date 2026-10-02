@@ -12,6 +12,7 @@ import (
 type progressReporter struct {
 	mu        sync.Mutex
 	out       io.Writer
+	verbose   bool
 	total     int
 	checked   int
 	completed int
@@ -43,7 +44,7 @@ func (p *progressReporter) checkFinished(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.checked++
-	fmt.Fprintf(p.out, "  [%d/%d] Checked %s\n", p.checked, p.total, path)
+	fmt.Fprintf(p.out, "  [%*d/%d] Checked %s\n", len(fmt.Sprint(p.total)), p.checked, p.total, path)
 }
 
 // finish records an update outcome, independently of scan completion.
@@ -51,5 +52,13 @@ func (p *progressReporter) finish(format string, args ...any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.completed++
-	fmt.Fprintf(p.out, "  [%d/%d] %s", p.completed, p.total, strings.TrimLeft(fmt.Sprintf(format, args...), " "))
+	fmt.Fprintf(p.out, "  [%*d/%d] %s", len(fmt.Sprint(p.total)), p.completed, p.total, strings.TrimLeft(fmt.Sprintf(format, args...), " "))
+}
+
+// detail reports activity only when explicitly requested.
+func (p *progressReporter) detail(format string, args ...any) {
+	if p == nil || !p.verbose {
+		return
+	}
+	p.printf(format, args...)
 }

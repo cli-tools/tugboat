@@ -83,6 +83,9 @@ func validateAndNormalizeV2(cfg *Config) error {
 			return fmt.Errorf("duplicate target name %q", t.Name)
 		}
 		nameSet[t.Name] = true
+		if err := t.ValidateExclusions(); err != nil {
+			return err
+		}
 	}
 
 	return nil

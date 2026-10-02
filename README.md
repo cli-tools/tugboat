@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.7.1
+VERSION=v0.8.0
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -78,7 +78,7 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 ```
 
 ## Commands
-- `clone [target ...]`   — org targets clone all repos; repo targets honor foldouts
+- `clone [target ...]`   — org targets clone repos except configured exclusions; repo targets honor foldouts
 - `status [target ...]`  — groups archived/attention/missing/empty state by target; `--all` expands clean rows
 - `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
 - `push [target ...]`
@@ -87,10 +87,45 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 - `help`, `version`
 
 `pull`, `push`, and `sync` print progress as they discover, check, and update
-repositories. Each repository gets a start line and a completion count, including
+repositories. During checking, each repository gets one numbered completion line
+(`[NN/MM] Checked ...`). Updates report a numbered result, including
 when no update is needed. Provider metadata requests also report progress. Scan
 completion (`Checked`) is separate from the update result. Output uses plain lines
 on stdout, so progress is also visible in redirected logs.
+Add `--verbose` to `pull`, `push`, or `sync` for per-repository check stages
+(including when `git fetch` starts) and update-start messages alongside normal
+numbered progress. For example: `tugboat pull t1 --verbose`.
+
+
+## Clone exclusions
+
+Add an optional `exclude` array to an organization target in your JSON config:
+
+```json
+{
+  "provider": "gitea",
+  "org": "t1",
+  "path": "~/t1",
+  "name": "t1",
+  "exclude": ["benchmark-runs", "scratch-*"]
+}
+```
+
+Patterns match the complete repository name, case-sensitively. Supported syntax
+is Go's `path.Match` syntax: `*` matches any sequence, `?` matches one character,
+and bracket classes such as `[abc]`, `[0-9]`, or `[^0-9]` match one character.
+Backslashes escape pattern characters and must themselves be escaped in JSON.
+Any matching pattern excludes the repository from that target's organization
+clone; the skip message shows which pattern matched.
+
+An omitted or empty array excludes nothing. Empty patterns, malformed globs,
+paths containing `/`, and leading `!` exception patterns are errors. A nonempty
+`exclude` array on a single-repository target is also an error. Invalid exclusions
+fail config loading for every command, before provider requests or cloning.
+
+Exclusions only affect organization-wide `clone`. They do not remove existing
+checkouts or affect other commands, explicit repository targets, or foldouts.
+No `.tugboatignore` file is read.
 
 ## Provider Options (defaults)
 - `clone.protocol`: https (ssh|https|auto)
@@ -128,11 +163,11 @@ on stdout, so progress is also visible in redirected logs.
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.7.1 binary with:
+For Codex, install the skill matching the v0.8.0 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.7.1
+SKILL_VERSION=v0.8.0
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

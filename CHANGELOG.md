@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.0 - 2026-10-02
+
+- Add per-organization `exclude` patterns to the JSON config so `clone` can skip repositories by name, including wildcards such as `benchmark-*`.
+- Reject invalid exclusion patterns and exclusions on single-repository targets before cloning starts. Omitted or empty exclusion lists preserve existing behavior.
+- Reduce default progress output to numbered check completions and update results, with aligned counts. Add `--verbose` to `pull`, `push`, and `sync` for detailed check stages and update-start messages.
+
 ## v0.7.1 - 2026-10-02
 
 - Show incremental repository progress during `pull`, `push`, and `sync`, including checks, fetches, provider metadata requests, and updates.

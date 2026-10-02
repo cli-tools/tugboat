@@ -148,13 +148,34 @@ func TestScanProgressArrivesBeforeOtherRepositoriesFinish(t *testing.T) {
 	release := gateGit(t, slow.workPath, "fetch")
 	output := observeCommand(t, func() error { return manager.Pull(nil, 2) }, func(out *observedOutput) {
 		defer release()
-		out.waitFor(t, "[CHECK] "+slow.workPath)
+		out.waitFor(t, "Checking 2 repositories...")
 		out.waitFor(t, "[1/2] Checked "+fast.workPath)
 		if strings.Contains(out.String(), "Checked "+slow.workPath) || strings.Contains(out.String(), "[START]") {
 			t.Fatalf("blocked scan was reported complete or updates started too early:\n%s", out.String())
 		}
 	})
 	assertProgressCounts(t, output, 2)
+	for _, marker := range []string{"[DETAIL]", "[START]"} {
+		if strings.Contains(output, marker) {
+			t.Fatalf("verbose output without flag: %s", output)
+		}
+	}
+}
+
+func TestVerboseReportsFetchBeforeItFinishes(t *testing.T) {
+	base := t.TempDir()
+	repository := createTestRepo(t, base, "acme", "app", "main", filepath.Join(base, "app"))
+	manager := newTestManager([]config.Target{repoTarget(repository)}, fakeClientForRepos(repository))
+	manager.Verbose = true
+	release := gateGit(t, repository.workPath, "fetch")
+	output := observeCommand(t, func() error { return manager.Pull(nil, 1) }, func(out *observedOutput) {
+		defer release()
+		out.waitFor(t, "[DETAIL] "+repository.workPath+": git fetch")
+		if strings.Contains(out.String(), "Checked ") {
+			t.Fatalf("blocked fetch reported complete:\n%s", out.String())
+		}
+	})
+	assertProgressCounts(t, output, 1)
 }
 
 func TestUpdateCommandsReportBeforeBlockedGitOperation(t *testing.T) {
@@ -168,6 +189,7 @@ func TestUpdateCommandsReportBeforeBlockedGitOperation(t *testing.T) {
 				gitCommand = "push"
 			}
 			manager := newTestManager([]config.Target{repoTarget(repo)}, fakeClientForRepos(repo))
+			manager.Verbose = true
 			release := gateGit(t, repo.workPath, gitCommand)
 			output := observeCommand(t, func() error {
 				switch command {
@@ -211,16 +233,19 @@ func TestMetadataProgressArrivesBeforeProviderReturns(t *testing.T) {
 
 func assertProgressCounts(t *testing.T, output string, total int) {
 	t.Helper()
+	if strings.Contains(output, "[CHECK]") {
+		t.Fatalf("duplicate check-start progress:\n%s", output)
+	}
 	for _, pattern := range []string{
-		`(?m)^  \[(\d+)/(\d+)\] Checked [^\n]+$`,
-		`(?m)^  \[(\d+)/(\d+)\] \[[A-Z]+\] [^\n]+$`,
+		`(?m)^  \[([ \d]+)/(\d+)\] Checked [^\n]+$`,
+		`(?m)^  \[([ \d]+)/(\d+)\] \[[A-Z]+\] [^\n]+$`,
 	} {
 		rows := regexp.MustCompile(pattern).FindAllStringSubmatch(output, -1)
 		if len(rows) != total {
 			t.Fatalf("got %d completions, want %d for %s:\n%s", len(rows), total, pattern, output)
 		}
 		for i, row := range rows {
-			if row[1] != fmt.Sprint(i+1) || row[2] != fmt.Sprint(total) {
+			if row[1] != fmt.Sprintf("%*d", len(fmt.Sprint(total)), i+1) || row[2] != fmt.Sprint(total) {
 				t.Fatalf("out-of-order completion %q:\n%s", row[0], output)
 			}
 		}
@@ -238,15 +263,14 @@ func TestProgressReporterSerializesParallelLines(t *testing.T) {
 		go func(i int) {
 			defer workers.Done()
 			path := fmt.Sprintf("/repos/%d", i)
-			progress.printf("  [CHECK] %s: checking and fetching\n", path)
 			progress.checkFinished(path)
 			progress.finish("  [OK]    %s: up to date\n", path)
 		}(i)
 	}
 	workers.Wait()
 	assertProgressCounts(t, output.String(), total)
-	if lines := strings.Count(output.String(), "\n"); lines != 1+3*total {
-		t.Fatalf("got %d lines, want %d", lines, 1+3*total)
+	if lines := strings.Count(output.String(), "\n"); lines != 1+2*total {
+		t.Fatalf("got %d lines, want %d", lines, 1+2*total)
 	}
 }
 

@@ -39,6 +39,20 @@ func parseWorkers(args []string) (int, []string) {
 	return workers, remaining
 }
 
+// parseVerbose accepts the flag before or after target names.
+func parseVerbose(args []string) (bool, []string) {
+	verbose := false
+	var remaining []string
+	for _, arg := range args {
+		if arg == "--verbose" {
+			verbose = true
+		} else {
+			remaining = append(remaining, arg)
+		}
+	}
+	return verbose, remaining
+}
+
 // resolveWorkers returns CLI workers if set, otherwise config workers (0 = use CPU count)
 func resolveWorkers(cliWorkers int, cfg *config.Config) int {
 	if cliWorkers > 0 {
@@ -127,6 +141,7 @@ Commands:
 Global Options:
   -w, --workers N   Number of parallel workers (default: config "workers" or CPU cores)
   -d, --debug       Show timing information (status command only)
+      --verbose     Show detailed activity (pull, push, sync)
 
 Configuration:
   tugboat reads from ~/.config/tugboat/config.json or TUGBOAT_CONFIG env var
@@ -201,6 +216,7 @@ func runSync(args []string) {
 		os.Exit(1)
 	}
 
+	verbose, args := parseVerbose(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 	removeArchived, targetNames := parseSyncArgs(args)
@@ -211,6 +227,7 @@ func runSync(args []string) {
 		os.Exit(1)
 	}
 	manager := repo.NewManager(clients, cfg)
+	manager.Verbose = verbose
 
 	if err := manager.Sync(targetNames, repo.SyncOptions{RemoveArchived: removeArchived, Workers: workers}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error syncing repositories: %v\n", err)
@@ -282,6 +299,7 @@ func runPull(args []string) {
 		os.Exit(1)
 	}
 
+	verbose, args := parseVerbose(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 
@@ -291,6 +309,7 @@ func runPull(args []string) {
 		os.Exit(1)
 	}
 	manager := repo.NewManager(clients, cfg)
+	manager.Verbose = verbose
 
 	if err := manager.Pull(args, workers); err != nil {
 		fmt.Fprintf(os.Stderr, "Error pulling repositories: %v\n", err)
@@ -305,6 +324,7 @@ func runPush(args []string) {
 		os.Exit(1)
 	}
 
+	verbose, args := parseVerbose(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 
@@ -314,6 +334,7 @@ func runPush(args []string) {
 		os.Exit(1)
 	}
 	manager := repo.NewManager(clients, cfg)
+	manager.Verbose = verbose
 
 	if err := manager.Push(args, workers); err != nil {
 		fmt.Fprintf(os.Stderr, "Error pushing repositories: %v\n", err)

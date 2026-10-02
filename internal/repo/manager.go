@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -81,6 +82,8 @@ type orgKey struct {
 func (k orgKey) string() string { return k.provider + "|" + k.org }
 
 type Manager struct {
+	// Verbose includes diagnostic activity alongside numbered progress.
+	Verbose   bool
 	providers map[string]remote.Client
 	config    *config.Config
 }
@@ -221,6 +224,12 @@ func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool
 	if err != nil {
 		return err
 	}
+	// Validate every selected target before any provider requests or cloning.
+	for _, t := range targets {
+		if err := t.ValidateExclusions(); err != nil {
+			return err
+		}
+	}
 
 	for _, t := range targets {
 		if t.Repo == "" {
@@ -258,7 +267,18 @@ func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, 
 
 	token := m.config.Providers[t.Provider].Token
 	var jobs []cloneJob
+repositories:
 	for _, r := range repos {
+		for _, pattern := range t.Exclude {
+			matched, err := path.Match(pattern, r.Name)
+			if err != nil {
+				return fmt.Errorf("target %q: matching exclude pattern %q: %w", t.Name, pattern, err)
+			}
+			if matched {
+				fmt.Printf("  [SKIP] %s/%s: excluded by pattern %q\n", t.Org, r.Name, pattern)
+				continue repositories
+			}
+		}
 		if r.Empty && excludeEmpty {
 			continue
 		}
@@ -758,7 +778,6 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 
 	progress.beginChecks(len(jobs))
 	results := pool.Run(jobs, workers, func(job statusJob) statusResult {
-		progress.printf("  [CHECK] %s: checking and fetching\n", job.path)
 		defer progress.checkFinished(job.path)
 		var timing RepoTiming
 		if job.missing {
@@ -767,7 +786,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 				Org: job.org, Name: job.name, Missing: true,
 			}}
 		}
-		status := getRepoStatus(job.path, job.target, job.org, job.name, job.provider, job.token, &timing)
+		status := getRepoStatusWithProgress(job.path, job.target, job.org, job.name, job.provider, job.token, &timing, progress)
 		return statusResult{status: status, timing: timing}
 	})
 
@@ -855,6 +874,10 @@ func getCurrentBranch(repoPath string) (string, error) {
 }
 
 func getRepoStatus(path, target, org, name, provider, token string, timing *RepoTiming) RepoStatus {
+	return getRepoStatusWithProgress(path, target, org, name, provider, token, timing, nil)
+}
+
+func getRepoStatusWithProgress(path, target, org, name, provider, token string, timing *RepoTiming, progress *progressReporter) RepoStatus {
 	totalStart := time.Now()
 	status := RepoStatus{
 		Path:     path,
@@ -865,6 +888,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	}
 
 	// Get current branch
+	progress.detail("  [DETAIL] %s: reading branch\n", path)
 	branchStart := time.Now()
 	branch, err := getCurrentBranch(path)
 	if timing != nil {
@@ -878,6 +902,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	status.Unborn = gitRun(path, "rev-parse", "--verify", "--quiet", "HEAD") != nil
 
 	// Fetch from remote
+	progress.detail("  [DETAIL] %s: git fetch\n", path)
 	fetchStart := time.Now()
 	if fetchErr := gitFetchWithStderr(path, token); fetchErr != "" {
 		status.RemoteError = fetchErr
@@ -890,6 +915,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	}
 
 	// Check for uncommitted changes
+	progress.detail("  [DETAIL] %s: git status\n", path)
 	statusStart := time.Now()
 	dirtyOutput, err := gitOutput(path, "status", "--porcelain")
 	if timing != nil {
@@ -902,6 +928,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 	status.Dirty = strings.TrimSpace(dirtyOutput) != ""
 
 	// Get ahead/behind counts
+	progress.detail("  [DETAIL] %s: counting ahead/behind commits\n", path)
 	revListStart := time.Now()
 	upstream := fmt.Sprintf("origin/%s", status.Branch)
 	var revList string
@@ -932,6 +959,7 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 		timing.RevList = time.Since(revListStart)
 	}
 
+	progress.detail("  [DETAIL] %s: checking fast-forward ancestry\n", path)
 	mergeBaseStart := time.Now()
 	if status.Behind > 0 {
 		err := gitRun(path, "merge-base", "--is-ancestor", status.Branch, upstream)
@@ -1674,7 +1702,7 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 	if err != nil {
 		return err
 	}
-	progress := &progressReporter{out: os.Stdout}
+	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
 	progress.printf("Pull: discovering repositories...\n")
 
 	var existingTargets []config.Target
@@ -1702,7 +1730,7 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 
 	var pulled, skipped, failed int
 	for _, s := range statuses {
-		progress.printf("  [START] %s: pull\n", s.Path)
+		progress.detail("  [START] %s: pull\n", s.Path)
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
 
@@ -1775,7 +1803,7 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 	if err != nil {
 		return err
 	}
-	progress := &progressReporter{out: os.Stdout}
+	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
 	progress.printf("Push: discovering repositories...\n")
 
 	statuses, _, err := m.getAllStatuses(targets, false, workers, progress)
@@ -1791,7 +1819,7 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 
 	var pushed, skipped, failed int
 	for _, s := range statuses {
-		progress.printf("  [START] %s: push\n", s.Path)
+		progress.detail("  [START] %s: push\n", s.Path)
 		if hasStatusError(s) {
 			progress.finish("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
 			failed++
@@ -1838,7 +1866,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	if err != nil {
 		return err
 	}
-	progress := &progressReporter{out: os.Stdout}
+	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
 	progress.printf("Sync: discovering repositories...\n")
 	statuses, _, err := m.getAllStatuses(targets, false, runOpts.Workers, progress)
 	if err != nil {
@@ -1859,7 +1887,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	var synced, removed, skipped, failed int
 	for _, s := range statuses {
 		if !(s.Archived && runOpts.RemoveArchived && !hasStatusError(s) && !s.Missing) {
-			progress.printf("  [START] %s: sync\n", s.Path)
+			progress.detail("  [START] %s: sync\n", s.Path)
 		}
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
@@ -1959,7 +1987,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		return leftDepth > rightDepth
 	})
 	for _, s := range archivedStatuses {
-		progress.printf("  [START] %s: checking archived checkout for removal\n", s.Path)
+		progress.detail("  [START] %s: checking archived checkout for removal\n", s.Path)
 		fastForwarded, err := m.removeArchivedRepo(s, targetMap[s.Target], tokenMap[s.Target])
 		if err != nil {
 			var skipErr *archiveSkipError

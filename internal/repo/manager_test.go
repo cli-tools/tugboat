@@ -787,6 +787,14 @@ func TestArchivedRemovalProcessesFoldoutsBeforeParent(t *testing.T) {
 	if _, err := os.Stat(parent.workPath); !os.IsNotExist(err) {
 		t.Fatalf("parent checkout still exists: %v\n%s", err, output)
 	}
+	assertProgressCounts(t, output, 2)
+	childResult := "[1/2] [REMOVE] " + child.workPath
+	parentStart := "[START] " + parent.workPath + ":"
+	parentResult := "[2/2] [REMOVE] " + parent.workPath
+	if !strings.Contains(output, childResult) || !strings.Contains(output, parentResult) ||
+		strings.Index(output, parentStart) < strings.Index(output, childResult) {
+		t.Fatalf("cleanup progress must complete the child before starting the parent:\n%s", output)
+	}
 	if strings.Count(output, "[REMOVE]") != 2 {
 		t.Fatalf("expected parent and child removal, got:\n%s", output)
 	}
@@ -809,6 +817,7 @@ func TestArchivedRemovalOriginMismatchIsOperationalError(t *testing.T) {
 	if syncErr == nil || !strings.Contains(output, "does not match provider repository") {
 		t.Fatalf("expected origin mismatch error, err=%v output:\n%s", syncErr, output)
 	}
+	assertProgressCounts(t, output, 1)
 	if !isGitRepo(repo.workPath) {
 		t.Fatal("origin-mismatched checkout was removed")
 	}
@@ -829,6 +838,7 @@ func TestArchivedRemovalProviderFailureIsOperationalError(t *testing.T) {
 	if syncErr == nil || !strings.Contains(output, "provider unavailable") {
 		t.Fatalf("expected provider metadata error, err=%v output:\n%s", syncErr, output)
 	}
+	assertProgressCounts(t, output, 1)
 	if !isGitRepo(repo.workPath) {
 		t.Fatal("checkout was removed without confirmed archive metadata")
 	}
@@ -970,14 +980,24 @@ func captureStdout(t *testing.T, fn func()) string {
 		os.Stdout = originalStdout
 	}()
 
+	var output []byte
+	var readErr error
+	drained := make(chan struct{})
+	go func() {
+		output, readErr = io.ReadAll(reader)
+		close(drained)
+	}()
+	defer reader.Close()
+	defer writer.Close()
+
 	fn()
 
 	if err := writer.Close(); err != nil {
 		t.Fatalf("closing writer: %v", err)
 	}
-	output, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("reading captured stdout: %v", err)
+	<-drained
+	if readErr != nil {
+		t.Fatalf("reading captured stdout: %v", readErr)
 	}
 	return string(output)
 }

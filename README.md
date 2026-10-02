@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.7.0
+VERSION=v0.7.1
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -86,6 +86,12 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 - `list [target ...]`    — shows local + remote; flags archived/orphan
 - `help`, `version`
 
+`pull`, `push`, and `sync` print progress as they discover, check, and update
+repositories. Each repository gets a start line and a completion count, including
+when no update is needed. Provider metadata requests also report progress. Scan
+completion (`Checked`) is separate from the update result. Output uses plain lines
+on stdout, so progress is also visible in redirected logs.
+
 ## Provider Options (defaults)
 - `clone.protocol`: https (ssh|https|auto)
 - `sync.ff_only`: true
@@ -122,11 +128,11 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.7.0 binary with:
+For Codex, install the skill matching the v0.7.1 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.7.0
+SKILL_VERSION=v0.7.1
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

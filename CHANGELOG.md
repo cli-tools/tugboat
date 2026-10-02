@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.1 - 2026-10-02
+
+- Show incremental repository progress during `pull`, `push`, and `sync`, including checks, fetches, provider metadata requests, and updates.
+- Report per-repository start messages and completion counts, with explicit results when no update is needed. Plain-text output also works in redirected logs.
+- Keep scan completion separate from update results, and report archived cleanup completion only after removal succeeds or the checkout is retained.
+
 ## v0.7.0 - 2026-07-19
 
 - Group status output by target and repository state, use relative paths, collapse clean rows by default, and report archived, orphaned, and missing counts in the summary.

@@ -61,15 +61,46 @@ func resolveWorkers(cliWorkers int, cfg *config.Config) int {
 	return cfg.Workers // 0 means pool.Run will use GOMAXPROCS
 }
 
-func parseSyncArgs(args []string) (removeArchived bool, targetNames []string) {
+func parseSyncArgs(args []string) (repo.SyncOptions, []string, error) {
+	var opts repo.SyncOptions
+	var targets []string
 	for _, arg := range args {
-		if arg == "--remove-archived" {
-			removeArchived = true
+		mode := repo.SyncBoth
+		switch arg {
+		case "--pull":
+			mode = repo.SyncPull
+		case "--push":
+			mode = repo.SyncPush
+		case "--clone-only":
+			mode = repo.SyncCloneOnly
+		case "--remove-archived":
+			opts.RemoveArchived = true
+			continue
+		case "--exclude-empty", "-E":
+			opts.ExcludeEmpty = true
+			continue
+		case "--include-archived", "-a":
+			opts.IncludeArchived = true
+			continue
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return opts, nil, fmt.Errorf("unknown sync option %s", arg)
+			}
+			targets = append(targets, arg)
 			continue
 		}
-		targetNames = append(targetNames, arg)
+		if opts.Mode != repo.SyncBoth && opts.Mode != mode {
+			return opts, nil, fmt.Errorf("--pull, --push, and --clone-only are mutually exclusive")
+		}
+		opts.Mode = mode
 	}
-	return removeArchived, targetNames
+	if opts.Mode != repo.SyncCloneOnly && (opts.ExcludeEmpty || opts.IncludeArchived) {
+		return opts, nil, fmt.Errorf("--exclude-empty and --include-archived require --clone-only")
+	}
+	if opts.RemoveArchived && (opts.Mode == repo.SyncCloneOnly || opts.Mode == repo.SyncPush) {
+		return opts, nil, fmt.Errorf("--remove-archived requires receiving sync")
+	}
+	return opts, targets, nil
 }
 
 func parseStatusArgs(args []string) (debug, showAll bool, targetNames []string) {
@@ -97,18 +128,12 @@ func main() {
 	cmd := os.Args[1]
 
 	switch cmd {
-	case "clone", "c":
-		runClone(os.Args[2:])
 	case "sync", "s":
 		runSync(os.Args[2:])
 	case "status", "st":
 		runStatus(os.Args[2:])
 	case "list", "ls":
 		runList(os.Args[2:])
-	case "pull":
-		runPull(os.Args[2:])
-	case "push":
-		runPush(os.Args[2:])
 	case "migrate":
 		runMigrate(os.Args[2:])
 	case "help", "-h", "--help":
@@ -128,20 +153,25 @@ func printHelp() {
 Usage: tugboat <command> [options]
 
 Commands:
-  clone, c      Clone targets (org or repo); -E/--exclude-empty, -a/--include-archived
-  sync, s       Reconcile org renames and sync; --remove-archived safely removes archives
+  sync, s       Clone missing repos, reconcile org renames, then pull and push
   status, st    Show grouped status; --all includes clean repository rows
   list, ls      List targets (local vs remote); -a/--include-archived
-  pull          Update targets on their default branch (ff-only)
-  push          Push targets
   migrate       Migrate config from v1 to v2 format
   help          Show this help message
   version       Show version information
 
+Sync Options:
+      --pull            Clone missing repos and pull; never push
+      --push            Push existing repos; never clone or pull
+      --clone-only      Clone and reconcile without updating branches
+      --remove-archived Also remove safe in-org archives and obsolete renamed duplicates
+  -E, --exclude-empty   Skip empty repos (--clone-only)
+  -a, --include-archived Include archives (--clone-only; also supported by list)
+
 Global Options:
   -w, --workers N   Number of parallel workers (default: config "workers" or CPU cores)
   -d, --debug       Show timing information (status command only)
-      --verbose     Show detailed activity (pull, push, sync)
+      --verbose     Show detailed sync activity
 
 Configuration:
   tugboat reads from ~/.config/tugboat/config.json or TUGBOAT_CONFIG env var
@@ -162,8 +192,10 @@ Configuration:
   You can also set GITEA_TOKEN environment variable.
 
 Examples:
-  tugboat clone          # Clone all repos from configured orgs
-  tugboat sync           # Preserve org renames, clone replacements, sync safely
+  tugboat sync           # Clone missing repos and sync safely
+  tugboat sync --pull    # Receive updates only
+  tugboat sync --push    # Send commits only
+  tugboat sync --clone-only # Create checkouts without updating branches
   tugboat sync --remove-archived  # Remove archived checkouts that pass every safety check
   tugboat status         # Show which repos have changes
   tugboat status --all   # Include clean repository rows
@@ -171,42 +203,6 @@ Examples:
   tugboat list           # List all managed repos
 `
 	fmt.Print(help)
-}
-
-func runClone(args []string) {
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	cliWorkers, args := parseWorkers(args)
-	workers := resolveWorkers(cliWorkers, cfg)
-	excludeEmpty := false
-	includeArchived := false
-	var targetNames []string
-	for _, arg := range args {
-		switch arg {
-		case "--exclude-empty", "-E":
-			excludeEmpty = true
-		case "--include-archived", "-a":
-			includeArchived = true
-		default:
-			targetNames = append(targetNames, arg)
-		}
-	}
-
-	clients, err := cfg.BuildRemoteClients()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
-		os.Exit(1)
-	}
-	manager := repo.NewManager(clients, cfg)
-
-	if err := manager.Clone(targetNames, excludeEmpty, includeArchived, workers); err != nil {
-		fmt.Fprintf(os.Stderr, "Error cloning repositories: %v\n", err)
-		os.Exit(1)
-	}
 }
 
 func runSync(args []string) {
@@ -219,7 +215,12 @@ func runSync(args []string) {
 	verbose, args := parseVerbose(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
-	removeArchived, targetNames := parseSyncArgs(args)
+	opts, targetNames, err := parseSyncArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid sync options: %v\n", err)
+		os.Exit(1)
+	}
+	opts.Workers = workers
 
 	clients, err := cfg.BuildRemoteClients()
 	if err != nil {
@@ -229,7 +230,7 @@ func runSync(args []string) {
 	manager := repo.NewManager(clients, cfg)
 	manager.Verbose = verbose
 
-	if err := manager.Sync(targetNames, repo.SyncOptions{RemoveArchived: removeArchived, Workers: workers}); err != nil {
+	if err := manager.Sync(targetNames, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error syncing repositories: %v\n", err)
 		os.Exit(1)
 	}
@@ -288,56 +289,6 @@ func runList(args []string) {
 
 	if err := manager.List(targetNames, includeArchived, workers); err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing repositories: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func runPull(args []string) {
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	verbose, args := parseVerbose(args)
-	cliWorkers, args := parseWorkers(args)
-	workers := resolveWorkers(cliWorkers, cfg)
-
-	clients, err := cfg.BuildRemoteClients()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
-		os.Exit(1)
-	}
-	manager := repo.NewManager(clients, cfg)
-	manager.Verbose = verbose
-
-	if err := manager.Pull(args, workers); err != nil {
-		fmt.Fprintf(os.Stderr, "Error pulling repositories: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func runPush(args []string) {
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	verbose, args := parseVerbose(args)
-	cliWorkers, args := parseWorkers(args)
-	workers := resolveWorkers(cliWorkers, cfg)
-
-	clients, err := cfg.BuildRemoteClients()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
-		os.Exit(1)
-	}
-	manager := repo.NewManager(clients, cfg)
-	manager.Verbose = verbose
-
-	if err := manager.Push(args, workers); err != nil {
-		fmt.Fprintf(os.Stderr, "Error pushing repositories: %v\n", err)
 		os.Exit(1)
 	}
 }

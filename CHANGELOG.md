@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.0 - 2026-10-08
+
+- Track provider repository IDs before fetching or updating checkouts, preventing old clones from being confused with replacement repositories that reuse their names.
+- Reconcile organization repository renames during `sync` and `clone`: preserve local work, update origin, and stage replacement clones with interruption recovery and no-overwrite moves on Linux.
+- Recover legacy checkouts from unique archived history matches; report ambiguous identities, explicit-target conflicts, and pending repairs in status/list output.
+- Verify repository IDs during archived cleanup and honor organization exclusions for replacement cloning.
+- Verify ordinary legacy checkouts against their current upstream before probing archives, and filter identity fetches to commit ancestry where supported.
+- Print one final result per repository by default; include branch switches and rename/replacement outcomes in that line, with intermediate activity available through `--verbose`.
+- Verify provider-confirmed origin redirects before repairing old URLs. Detect archived transfers outside an organization and stop normal maintenance; explicit archive cleanup may remove them only after all safety checks pass, preparing replacements before deletion.
+
 ## v0.8.0 - 2026-10-02
 
 - Add per-organization `exclude` patterns to the JSON config so `clone` can skip repositories by name, including wildcards such as `benchmark-*`.

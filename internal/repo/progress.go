@@ -16,6 +16,8 @@ type progressReporter struct {
 	total     int
 	checked   int
 	completed int
+	notes     map[string][]string
+	removed   map[string]bool
 }
 
 func (p *progressReporter) printf(format string, args ...any) {
@@ -34,11 +36,13 @@ func (p *progressReporter) beginChecks(total int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.total = total
-	fmt.Fprintf(p.out, "Checking %d repositories...\n", total)
+	if p.verbose {
+		fmt.Fprintf(p.out, "Checking %d repositories...\n", total)
+	}
 }
 
 func (p *progressReporter) checkFinished(path string) {
-	if p == nil {
+	if p == nil || !p.verbose {
 		return
 	}
 	p.mu.Lock()
@@ -52,7 +56,26 @@ func (p *progressReporter) finish(format string, args ...any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.completed++
-	fmt.Fprintf(p.out, "  [%*d/%d] %s", len(fmt.Sprint(p.total)), p.completed, p.total, strings.TrimLeft(fmt.Sprintf(format, args...), " "))
+	line := strings.TrimSpace(fmt.Sprintf(format, args...))
+	line = strings.ReplaceAll(line, "\n", "; ")
+	if len(args) > 0 {
+		if path, ok := args[0].(string); ok && len(p.notes[path]) > 0 {
+			line += "; " + strings.Join(p.notes[path], "; ")
+		}
+	}
+	fmt.Fprintf(p.out, "  [%*d/%d] %s\n", len(fmt.Sprint(p.total)), p.completed, p.total, line)
+}
+
+func (p *progressReporter) note(path, message string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.notes == nil {
+		p.notes = make(map[string][]string)
+	}
+	p.notes[path] = append(p.notes[path], message)
 }
 
 // detail reports activity only when explicitly requested.

@@ -140,11 +140,12 @@ func (c gatedMetadataClient) ListOrgRepos(org string) ([]remote.Repository, erro
 	return c.Client.ListOrgRepos(org)
 }
 
-func TestScanProgressArrivesBeforeOtherRepositoriesFinish(t *testing.T) {
+func TestVerboseScanProgressArrivesBeforeOtherRepositoriesFinish(t *testing.T) {
 	base := t.TempDir()
 	slow := createTestRepo(t, base, "acme", "slow", "main", filepath.Join(base, "slow"))
 	fast := createTestRepo(t, base, "acme", "fast", "main", filepath.Join(base, "fast"))
 	manager := newTestManager([]config.Target{repoTarget(slow), repoTarget(fast)}, fakeClientForRepos(slow, fast))
+	manager.Verbose = true
 	release := gateGit(t, slow.workPath, "fetch")
 	output := observeCommand(t, func() error { return manager.Pull(nil, 2) }, func(out *observedOutput) {
 		defer release()
@@ -154,12 +155,7 @@ func TestScanProgressArrivesBeforeOtherRepositoriesFinish(t *testing.T) {
 			t.Fatalf("blocked scan was reported complete or updates started too early:\n%s", out.String())
 		}
 	})
-	assertProgressCounts(t, output, 2)
-	for _, marker := range []string{"[DETAIL]", "[START]"} {
-		if strings.Contains(output, marker) {
-			t.Fatalf("verbose output without flag: %s", output)
-		}
-	}
+	assertProgressCounts(t, output, 2, true)
 }
 
 func TestVerboseReportsFetchBeforeItFinishes(t *testing.T) {
@@ -175,7 +171,7 @@ func TestVerboseReportsFetchBeforeItFinishes(t *testing.T) {
 			t.Fatalf("blocked fetch reported complete:\n%s", out.String())
 		}
 	})
-	assertProgressCounts(t, output, 1)
+	assertProgressCounts(t, output, 1, true)
 }
 
 func TestUpdateCommandsReportBeforeBlockedGitOperation(t *testing.T) {
@@ -207,7 +203,7 @@ func TestUpdateCommandsReportBeforeBlockedGitOperation(t *testing.T) {
 					t.Fatalf("blocked operation reported complete:\n%s", out.String())
 				}
 			})
-			assertProgressCounts(t, output, 1)
+			assertProgressCounts(t, output, 1, true)
 		})
 	}
 }
@@ -231,15 +227,18 @@ func TestMetadataProgressArrivesBeforeProviderReturns(t *testing.T) {
 	assertProgressCounts(t, output, 1)
 }
 
-func assertProgressCounts(t *testing.T, output string, total int) {
+func assertProgressCounts(t *testing.T, output string, total int, verbose ...bool) {
 	t.Helper()
 	if strings.Contains(output, "[CHECK]") {
 		t.Fatalf("duplicate check-start progress:\n%s", output)
 	}
-	for _, pattern := range []string{
-		`(?m)^  \[([ \d]+)/(\d+)\] Checked [^\n]+$`,
-		`(?m)^  \[([ \d]+)/(\d+)\] \[[A-Z]+\] [^\n]+$`,
-	} {
+	patterns := []string{`(?m)^  \[([ \d]+)/(\d+)\] \[[A-Z]+\] [^\n]+$`}
+	if len(verbose) > 0 && verbose[0] {
+		patterns = append(patterns, `(?m)^  \[([ \d]+)/(\d+)\] Checked [^\n]+$`)
+	} else if strings.Contains(output, "Checked ") || strings.Contains(output, "[DETAIL]") || strings.Contains(output, "[START]") {
+		t.Fatalf("intermediate output without verbose flag:\n%s", output)
+	}
+	for _, pattern := range patterns {
 		rows := regexp.MustCompile(pattern).FindAllStringSubmatch(output, -1)
 		if len(rows) != total {
 			t.Fatalf("got %d completions, want %d for %s:\n%s", len(rows), total, pattern, output)
@@ -254,7 +253,7 @@ func assertProgressCounts(t *testing.T, output string, total int) {
 
 func TestProgressReporterSerializesParallelLines(t *testing.T) {
 	var output bytes.Buffer
-	progress := &progressReporter{out: &output}
+	progress := &progressReporter{out: &output, verbose: true}
 	const total = 100
 	progress.beginChecks(total)
 	var workers sync.WaitGroup
@@ -268,7 +267,7 @@ func TestProgressReporterSerializesParallelLines(t *testing.T) {
 		}(i)
 	}
 	workers.Wait()
-	assertProgressCounts(t, output.String(), total)
+	assertProgressCounts(t, output.String(), total, true)
 	if lines := strings.Count(output.String(), "\n"); lines != 1+2*total {
 		t.Fatalf("got %d lines, want %d", lines, 1+2*total)
 	}

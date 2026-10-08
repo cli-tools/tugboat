@@ -31,3 +31,9 @@ type Client interface {
 	ListOrgRepos(orgName string) ([]Repository, error)
 	GetRepo(owner, repoName string) (*Repository, error)
 }
+
+// Optional provider-wide archive discovery, used only when a legacy checkout
+// does not match its current upstream. Transfers may leave its configured org.
+type ArchivedRepositoryLister interface {
+	ListArchivedRepos() ([]Repository, error)
+}

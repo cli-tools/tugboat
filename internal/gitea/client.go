@@ -84,20 +84,7 @@ func (c *Client) ListOrgRepos(orgName string) ([]remote.Repository, error) {
 		}
 
 		for _, r := range repos {
-			allRepos = append(allRepos, remote.Repository{
-				ID:            r.ID,
-				Name:          r.Name,
-				FullName:      r.FullName,
-				Description:   r.Description,
-				CloneURL:      r.CloneURL,
-				SSHURL:        r.SSHURL,
-				HTMLURL:       r.HTMLURL,
-				DefaultBranch: r.DefaultBranch,
-				Empty:         r.Empty,
-				Archived:      r.Archived,
-				Private:       r.Private,
-				Fork:          r.Fork,
-			})
+			allRepos = append(allRepos, normalizeRepository(r))
 		}
 
 		if len(repos) < limit {
@@ -142,18 +129,55 @@ func (c *Client) GetRepo(owner, repoName string) (*remote.Repository, error) {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 
-	return &remote.Repository{
-		ID:            repo.ID,
-		Name:          repo.Name,
-		FullName:      repo.FullName,
-		Description:   repo.Description,
-		CloneURL:      repo.CloneURL,
-		SSHURL:        repo.SSHURL,
-		HTMLURL:       repo.HTMLURL,
-		DefaultBranch: repo.DefaultBranch,
-		Empty:         repo.Empty,
-		Archived:      repo.Archived,
-		Private:       repo.Private,
-		Fork:          repo.Fork,
-	}, nil
+	normalized := normalizeRepository(repo)
+	return &normalized, nil
+}
+
+func normalizeRepository(r Repository) remote.Repository {
+	return remote.Repository{ID: r.ID, Name: r.Name, FullName: r.FullName,
+		Description: r.Description, CloneURL: r.CloneURL, SSHURL: r.SSHURL,
+		HTMLURL: r.HTMLURL, DefaultBranch: r.DefaultBranch, Empty: r.Empty,
+		Archived: r.Archived, Private: r.Private, Fork: r.Fork}
+}
+
+// ListArchivedRepos includes accessible archives outside the configured org.
+func (c *Client) ListArchivedRepos() ([]remote.Repository, error) {
+	var all []remote.Repository
+	for page := 1; ; page++ {
+		endpoint := fmt.Sprintf("%s/api/v1/repos/search?archived=true&private=true&limit=50&page=%d", c.baseURL, page)
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "token "+c.token)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			OK   bool         `json:"ok"`
+			Data []Repository `json:"data"`
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("archive search failed (status %d)", resp.StatusCode)
+		}
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if !result.OK {
+			return nil, fmt.Errorf("provider archive search failed")
+		}
+		for _, r := range result.Data {
+			if r.Archived {
+				all = append(all, normalizeRepository(r))
+			}
+		}
+		if len(result.Data) < 50 && !strings.Contains(resp.Header.Get("Link"), `rel="next"`) {
+			return all, nil
+		}
+	}
 }

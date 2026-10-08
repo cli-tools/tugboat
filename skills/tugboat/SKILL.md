@@ -48,7 +48,7 @@ tugboat version               # Show version
 ### Options
 - `-w, --workers N` - Parallel workers (default: CPU cores)
 - `-d, --debug` - Show timing info (status only)
-- `--verbose` - Show detailed check stages and update-start messages (pull, push, sync)
+- `--verbose` - Show intermediate identity downloads, check completions, Git operations, and update-start messages (pull, push, sync). Default output has one final result per repository.
 - `--all` - Include clean repository rows (status only)
 - `--remove-archived` - Permanently remove safe archived checkouts (sync only)
 - `-E, --exclude-empty` - Skip empty repos (clone only)
@@ -110,7 +110,44 @@ tugboat version               # Show version
 
 Organization targets can set `"exclude": ["benchmark-runs", "scratch-*"]` to skip matching repositories during `clone`. Patterns match complete repository names case-sensitively using Go's `path.Match` syntax (`*`, `?`, bracket classes, and escaping). An omitted or empty list excludes nothing.
 
-Empty patterns, malformed globs, `/` paths, and leading `!` exceptions fail config loading. Nonempty exclusions on single-repository targets are also errors. Exclusions do not remove existing checkouts or affect other commands, explicit repository targets, or foldouts. No `.tugboatignore` file is read.
+Empty patterns, malformed globs, `/` paths, and leading `!` exceptions fail config loading. Nonempty exclusions on single-repository targets are also errors. Exclusions also apply to replacement clones made by `sync`. They do not remove existing checkouts or prevent rename preservation, and do not affect updates to existing checkouts, explicit repository targets, or foldouts. No `.tugboatignore` file is read.
+
+## Renamed and Replaced Repositories
+
+For organization targets, `sync` and `clone` preserve a renamed checkout at its
+current remote name, update origin, and clone any replacement into the freed
+name. Dirty files, ignored files, local commits, branches, and stashes stay with
+the preserved checkout. Explicit repo targets and foldouts report conflicts
+without moving configured paths. `sync` clones replacements only, not unrelated
+missing repositories; replacement cloning honors organization exclusions.
+
+Provider instance and repository ID are saved in `.git/tugboat.json`, checked
+before fetching local refs. Existing checkouts without IDs first verify matching
+origin and history against the current active upstream without probing archives.
+Copied/shared history at that upstream is treated as belonging to it; manually
+identify a checkout first if it must follow an archive instead. Unrelated histories
+use unique history recovery from accessible provider archives, including transfers.
+Multiple archive matches, shallow histories,
+or ambiguous empty histories require manual identification; follow the README's
+`.git/tugboat.json` example using the correct provider ID. History probes request
+commit ancestry without file contents when the server supports filtered fetches.
+Never identify a checkout by the replacement's ID merely because its name matches.
+
+`status`/`list` report pending changes; `pull`/`push` skip pending repairs. Use
+`sync TARGET` to reconcile organization targets. Moves refuse occupied paths,
+symlinks, linked worktrees, nested checkouts, explicit worktree paths, active Git
+operations, and conflicting fetch/push URLs. Interrupted replacements resume on
+a subsequent `sync` or `clone`. `--remove-archived` retains every cleanup guard
+and verifies the repository ID before deletion, after replacement publication.
+Automatic directory moves currently use Linux primitives; other platforms detect
+changes and retain normal clone/update commands.
+
+Transfers out of the target org leave maintenance. Normal sync/clone stop and
+report their destination without creating another directory layout. Only explicit
+`sync --remove-archived` can discard an identified transferred archive, with all
+existing safety checks. Local work or stashes stop cleanup and retain the checkout;
+replacement cloning is prepared before deletion. Other provider instances remain
+manual.
 
 ## Foldouts (.tugboat.json)
 

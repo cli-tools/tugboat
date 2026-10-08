@@ -129,7 +129,7 @@ Usage: tugboat <command> [options]
 
 Commands:
   clone, c      Clone targets (org or repo); -E/--exclude-empty, -a/--include-archived
-  sync, s       Sync targets; --remove-archived safely removes archived checkouts
+  sync, s       Reconcile org renames and sync; --remove-archived safely removes archives
   status, st    Show grouped status; --all includes clean repository rows
   list, ls      List targets (local vs remote); -a/--include-archived
   pull          Update targets on their default branch (ff-only)
@@ -163,7 +163,7 @@ Configuration:
 
 Examples:
   tugboat clone          # Clone all repos from configured orgs
-  tugboat sync           # Sync default branches safely
+  tugboat sync           # Preserve org renames, clone replacements, sync safely
   tugboat sync --remove-archived  # Remove archived checkouts that pass every safety check
   tugboat status         # Show which repos have changes
   tugboat status --all   # Include clean repository rows

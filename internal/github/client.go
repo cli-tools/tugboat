@@ -33,12 +33,20 @@ func NewClient(apiBase, token string) *Client {
 
 // ListOrgRepos lists all repositories in a GitHub organization.
 func (c *Client) ListOrgRepos(orgName string) ([]remote.Repository, error) {
+	return c.listRepos("/orgs/"+url.PathEscape(orgName)+"/repos?type=all", false)
+}
+
+func (c *Client) ListArchivedRepos() ([]remote.Repository, error) {
+	return c.listRepos("/user/repos?affiliation=owner,collaborator,organization_member", true)
+}
+
+func (c *Client) listRepos(resource string, archivedOnly bool) ([]remote.Repository, error) {
 	var all []remote.Repository
 	page := 1
 	perPage := 100
 
 	for {
-		endpoint := fmt.Sprintf("%s/orgs/%s/repos?per_page=%d&page=%d&type=all", c.apiBase, url.PathEscape(orgName), perPage, page)
+		endpoint := fmt.Sprintf("%s%s&per_page=%d&page=%d", c.apiBase, resource, perPage, page)
 
 		req, err := http.NewRequest("GET", endpoint, nil)
 		if err != nil {
@@ -81,6 +89,9 @@ func (c *Client) ListOrgRepos(orgName string) ([]remote.Repository, error) {
 		}
 
 		for _, r := range repos {
+			if archivedOnly && !r.Archived {
+				continue
+			}
 			all = append(all, remote.Repository{
 				ID:            r.ID,
 				Name:          r.Name,

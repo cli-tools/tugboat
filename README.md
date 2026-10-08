@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.8.0
+VERSION=v0.9.0
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -82,19 +82,16 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 - `status [target ...]`  — groups archived/attention/missing/empty state by target; `--all` expands clean rows
 - `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
 - `push [target ...]`
-- `sync [target ...]`    — syncs default branches only; `--remove-archived` removes verified-safe archived checkouts
+- `sync [target ...]`    — reconciles org repository renames, then syncs default branches; `--remove-archived` removes verified-safe archived checkouts
 - `list [target ...]`    — shows local + remote; flags archived/orphan
 - `help`, `version`
 
-`pull`, `push`, and `sync` print progress as they discover, check, and update
-repositories. During checking, each repository gets one numbered completion line
-(`[NN/MM] Checked ...`). Updates report a numbered result, including
-when no update is needed. Provider metadata requests also report progress. Scan
-completion (`Checked`) is separate from the update result. Output uses plain lines
-on stdout, so progress is also visible in redirected logs.
-Add `--verbose` to `pull`, `push`, or `sync` for per-repository check stages
-(including when `git fetch` starts) and update-start messages alongside normal
-numbered progress. For example: `tugboat pull t1 --verbose`.
+`pull`, `push`, and `sync` print one numbered final result per repository by
+default, including when no update is needed. Branch switches, rename preservation,
+and replacement cloning are included in that result. Provider metadata requests
+also report progress. Output uses plain lines on stdout, including redirected logs.
+Add `--verbose` for intermediate identity downloads, check completions, Git
+operations, and update-start messages. For example: `tugboat pull t1 --verbose`.
 
 
 ## Clone exclusions
@@ -123,9 +120,86 @@ paths containing `/`, and leading `!` exception patterns are errors. A nonempty
 `exclude` array on a single-repository target is also an error. Invalid exclusions
 fail config loading for every command, before provider requests or cloning.
 
-Exclusions only affect organization-wide `clone`. They do not remove existing
-checkouts or affect other commands, explicit repository targets, or foldouts.
+Exclusions affect organization-wide cloning, including replacement clones made
+by `sync`. They do not remove existing checkouts, prevent rename preservation,
+or affect updates to existing checkouts, explicit repository targets, or foldouts.
 No `.tugboatignore` file is read.
+
+## Renamed and replaced repositories
+
+For organization targets, `sync` and `clone` automatically reconcile repository
+renames. If the old `perception` is renamed and archived as `perception-yolo`, and
+a different repository takes the name `perception`, Tugboat:
+
+1. Prepares a fresh clone of the replacement.
+2. Moves the old checkout to `perception-yolo` and updates its origin.
+3. Places the replacement at `perception`.
+
+The preserved checkout keeps its branches, commits, stashes, and tracked,
+untracked, and ignored files, including dirty work. Reconciliation does not
+switch or rebase its branches. Archived checkouts remain skipped during normal
+updates. `sync --remove-archived` can subsequently remove the preserved checkout
+only when all existing cleanup checks pass.
+
+Tugboat saves provider instance and repository ID in `.git/tugboat.json`. It
+checks identity before fetching into local refs. `status` and `list` report
+pending changes without moving folders or saving identity metadata. `pull` and
+`push` skip pending repairs; run `sync` to resolve organization targets.
+Explicit repo targets and foldouts report conflicts without relocating their
+configured paths or editing configuration.
+
+Older checkouts have no saved ID. A matching origin and history with the current
+active upstream take the fast path: Tugboat records that repository's ID without
+probing archives. This treats copied/shared history at the current upstream as
+that upstream; manually identify a checkout first if it must instead follow an archive.
+When current upstream history does not match, Tugboat compares committed history
+against accessible archives on the provider, including archives transferred out
+of the organization. Only a unique archive match permits
+recovery. This also works after an attempted pull has fetched the replacement
+into `origin/*`. Multiple archive matches, shallow histories, and ambiguous empty
+histories require manual identification. Candidate histories are cached in
+temporary bare repositories within a command. Servers supporting filtered fetches
+send commit ancestry without file contents.
+
+To identify an ambiguous checkout, obtain its **correct repository ID** from the
+provider API and create `.git/tugboat.json` in that checkout, for example:
+
+```json
+{
+  "version": 1,
+  "provider_type": "gitea",
+  "api_url": "https://gitea.example.com",
+  "repository_id": 123,
+  "full_name": "t1/perception-yolo",
+  "origin": "gitea.example.com/t1/perception"
+}
+```
+
+Use the configured provider type and API URL (without credentials, query strings,
+or a trailing slash). `origin` is the existing origin normalized to
+`host[:port]/owner/repo`, without credentials, scheme, or `.git`; local file
+origins use their absolute path. The ID must identify the preserved repository,
+not its replacement. Then run `tugboat sync TARGET`. Provider aliases and token
+rotation do not change identity. A transfer out of the target organization leaves
+maintenance: normal `sync` and `clone` stop and report its destination without
+moving or updating that checkout. Resolve it locally, or use
+`sync --remove-archived` to discard an identified transferred archive only after
+every cleanup check passes. Dirty files, local-only commits, or stashes stop that
+cleanup and leave the checkout intact. Replacement clones are prepared before
+cleanup so a clone failure retains the original. Tugboat creates no extra
+directory layout for transferred checkouts. Other provider instances require
+manual handling.
+
+Occupied destinations, symlinked checkout/Git directories, linked worktrees,
+nested checkouts, explicit `core.worktree` paths, active Git operations, and
+conflicting fetch/push URLs prevent automatic moves. Interrupted replacement
+operations record a pending marker so a later `sync` or `clone` can resume.
+Replacement cloning honors organization exclusions; normal `sync` does not clone
+unrelated missing repositories.
+
+Automatic directory reconciliation uses Linux locks and atomic no-replace
+renames, matching the supported release platforms. Other platforms report
+pending changes and retain ordinary cloning and update commands.
 
 ## Provider Options (defaults)
 - `clone.protocol`: https (ssh|https|auto)
@@ -163,11 +237,11 @@ No `.tugboatignore` file is read.
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.8.0 binary with:
+For Codex, install the skill matching the v0.9.0 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.8.0
+SKILL_VERSION=v0.9.0
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

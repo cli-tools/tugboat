@@ -31,6 +31,16 @@ type RepoTiming struct {
 }
 
 type RepoStatus struct {
+	RepositoryID   int64
+	RemoteName     string
+	ReplacementID  int64
+	IdentityIssue  string
+	ReconcileError bool
+	Transferred    bool
+	Removed        bool
+	identity       *checkoutIdentity
+	repository     *remote.Repository
+	gitDirInfo     os.FileInfo
 	Path           string
 	Target         string
 	Provider       string
@@ -201,9 +211,11 @@ func cleanFoldoutTargets(base string, repos []foldoutRepo) error {
 // ------------ clone --------------
 
 type cloneJob struct {
-	cloneURL string
-	repoPath string
-	repoName string
+	provider   string
+	org        string
+	repository remote.Repository
+	repoPath   string
+	repoName   string
 }
 
 type cloneResult struct {
@@ -231,9 +243,11 @@ func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool
 		}
 	}
 
+	probe := &historyProbe{progress: &progressReporter{out: os.Stdout, verbose: m.Verbose}}
+	defer probe.close()
 	for _, t := range targets {
 		if t.Repo == "" {
-			if err := m.cloneOrg(t, excludeEmpty, includeArchived, workers); err != nil {
+			if err := m.cloneOrg(t, excludeEmpty, includeArchived, workers, probe); err != nil {
 				return err
 			}
 		} else {
@@ -246,7 +260,7 @@ func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool
 	return nil
 }
 
-func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, workers int) error {
+func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, workers int, probe *historyProbe) error {
 	client, ok := m.providers[t.Provider]
 	if !ok {
 		return fmt.Errorf("no client for provider %s", t.Provider)
@@ -257,7 +271,24 @@ func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, 
 		return fmt.Errorf("listing repos for %s: %w", t.Org, err)
 	}
 
-	// Build index for archived/orphan marking later (during status)
+	remoteMap := make(map[string]remote.Repository)
+	for _, r := range repos {
+		remoteMap[r.Name] = r
+	}
+	fmt.Printf("Org %s: checking repository identities and renames...\n", t.Org)
+	for dir, err := range m.reconcileOrg(t, remoteMap, probe, excludeEmpty, includeArchived) {
+		return fmt.Errorf("reconciling %s: %w", dir, err)
+	}
+	var reconciledPaths []string
+	for path := range probe.progress.notes {
+		if filepath.Dir(path) == t.Path {
+			reconciledPaths = append(reconciledPaths, path)
+		}
+	}
+	sort.Strings(reconciledPaths)
+	for _, path := range reconciledPaths {
+		fmt.Printf("  [RECONCILED] %s: %s\n", path, strings.Join(probe.progress.notes[path], "; "))
+	}
 
 	if err := os.MkdirAll(t.Path, 0755); err != nil {
 		return fmt.Errorf("creating directory %s: %w", t.Path, err)
@@ -265,7 +296,6 @@ func (m *Manager) cloneOrg(t config.Target, excludeEmpty, includeArchived bool, 
 
 	sort.Slice(repos, func(i, j int) bool { return repos[i].Name < repos[j].Name })
 
-	token := m.config.Providers[t.Provider].Token
 	var jobs []cloneJob
 repositories:
 	for _, r := range repos {
@@ -290,7 +320,7 @@ repositories:
 			continue
 		}
 		jobs = append(jobs, cloneJob{
-			cloneURL: pickCloneURL(&r, m.config.Providers[t.Provider].Options.Clone.Protocol),
+			provider: t.Provider, org: t.Org, repository: r,
 			repoPath: dest,
 			repoName: r.Name,
 		})
@@ -304,11 +334,8 @@ repositories:
 	fmt.Printf("Org %s: cloning %d repositories...\n", t.Org, len(jobs))
 
 	results := pool.Run(jobs, workers, func(job cloneJob) cloneResult {
-		cmd := exec.Command("git", "clone", job.cloneURL, job.repoPath)
-		cmd.Env = gitEnvWithAuth(token)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return cloneResult{repoName: job.repoName, status: "error", err: fmt.Errorf("%v: %s", err, output)}
+		if err := m.cloneVerified(job.provider, job.org, job.repository, job.repoPath); err != nil {
+			return cloneResult{repoName: job.repoName, status: "error", err: err}
 		}
 		return cloneResult{repoName: job.repoName, status: "cloned"}
 	})
@@ -324,6 +351,9 @@ repositories:
 		}
 	}
 	fmt.Printf("Org %s: clone complete (%d cloned, %d failed)\n", t.Org, cloned, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d clones failed", failed)
+	}
 	return nil
 }
 
@@ -340,6 +370,17 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		return fmt.Errorf("repo %s/%s not found (check that the repo exists and your token has access)", t.Org, t.Repo)
 	}
 
+	if isGitRepo(t.Path) {
+		if err := m.verifyExistingClone(t.Provider, t.Org, t.Repo, t.Path); err != nil {
+			var skip *updateSkipError
+			if errors.As(err, &skip) {
+				fmt.Printf("  [SKIP] %s: %s; explicit targets are not relocated automatically\n", t.Path, skip.reason)
+				return nil
+			}
+			return err
+		}
+	}
+
 	if repo.Empty && excludeEmpty {
 		fmt.Printf("Skipping empty repo: %s/%s\n", t.Org, t.Repo)
 		return nil
@@ -353,15 +394,9 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		return fmt.Errorf("creating parent dir: %w", err)
 	}
 
-	token := m.config.Providers[t.Provider].Token
 	if !isGitRepo(t.Path) {
-		cloneURL := pickCloneURL(repo, m.config.Providers[t.Provider].Options.Clone.Protocol)
 		fmt.Printf("Cloning %s/%s -> %s\n", t.Org, t.Repo, t.Path)
-		cmd := exec.Command("git", "clone", cloneURL, t.Path)
-		cmd.Env = gitEnvWithAuth(token)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			os.Stderr.Write(out)
+		if err := m.cloneVerified(t.Provider, t.Org, *repo, t.Path); err != nil {
 			return err
 		}
 	} else {
@@ -384,9 +419,6 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 	var jobs []cloneJob
 	for _, fr := range fc.Repos {
 		dest := filepath.Join(t.Path, fr.Target)
-		if isGitRepo(dest) {
-			continue
-		}
 		parts := strings.Split(fr.Name, "/")
 		org := parts[0]
 		repoName := parts[1]
@@ -398,6 +430,17 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 			fmt.Printf("  [MISS] %s not found\n", fr.Name)
 			continue
 		}
+		if isGitRepo(dest) {
+			if err := m.verifyExistingClone(t.Provider, org, repoName, dest); err != nil {
+				var skip *updateSkipError
+				if errors.As(err, &skip) {
+					fmt.Printf("  [SKIP] %s: %s; foldouts are not relocated automatically\n", dest, skip.reason)
+					continue
+				}
+				return err
+			}
+			continue
+		}
 		if r.Empty && excludeEmpty {
 			continue
 		}
@@ -405,7 +448,7 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 			continue
 		}
 		jobs = append(jobs, cloneJob{
-			cloneURL: pickCloneURL(r, m.config.Providers[t.Provider].Options.Clone.Protocol),
+			provider: t.Provider, org: org, repository: *r,
 			repoPath: dest,
 			repoName: fr.Name,
 		})
@@ -416,20 +459,22 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 	}
 	fmt.Printf("Foldout: cloning %d repos under %s\n", len(jobs), t.Path)
 	results := pool.Run(jobs, workers, func(job cloneJob) cloneResult {
-		cmd := exec.Command("git", "clone", job.cloneURL, job.repoPath)
-		cmd.Env = gitEnvWithAuth(token)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return cloneResult{repoName: job.repoName, status: "error", err: fmt.Errorf("%v: %s", err, output)}
+		if err := m.cloneVerified(job.provider, job.org, job.repository, job.repoPath); err != nil {
+			return cloneResult{repoName: job.repoName, status: "error", err: err}
 		}
 		return cloneResult{repoName: job.repoName, status: "cloned"}
 	})
+	var failed int
 	for _, r := range results {
 		if r.status == "cloned" {
 			fmt.Printf("  [CLONED] %s\n", r.repoName)
 		} else {
-			fmt.Printf("  [ERROR]  %s: %v\n", r.repoName, r.err)
+			fmt.Printf("  [ERROR] %s: %v\n", r.repoName, r.err)
+			failed++
 		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d foldout clones failed", failed)
 	}
 	return nil
 }
@@ -451,13 +496,14 @@ func pickCloneURL(r *remote.Repository, protocol string) string {
 // ------------ status / sync / pull / push --------------
 
 type statusJob struct {
-	path     string
-	target   string
-	name     string
-	org      string
-	provider string
-	token    string
-	missing  bool
+	path      string
+	target    string
+	name      string
+	org       string
+	provider  string
+	token     string
+	missing   bool
+	fixedPath bool
 }
 
 type statusResult struct {
@@ -568,6 +614,9 @@ func statusErrorMessage(s RepoStatus) string {
 }
 
 func statusGroupFor(s RepoStatus) statusGroup {
+	if s.IdentityIssue != "" {
+		return groupAttention
+	}
 	if s.Archived {
 		return groupArchived
 	}
@@ -584,6 +633,15 @@ func statusGroupFor(s RepoStatus) statusGroup {
 }
 
 func primaryStatus(s RepoStatus) string {
+	if s.Transferred {
+		return "TRANSFERRED"
+	}
+	if s.IdentityIssue != "" {
+		if s.RemoteName != "" {
+			return "RENAMED"
+		}
+		return "IDENTITY"
+	}
 	if s.Archived {
 		return "ARCHIVED"
 	}
@@ -616,6 +674,12 @@ func primaryStatus(s RepoStatus) string {
 
 func statusDetails(s RepoStatus, state string) string {
 	var details []string
+	if s.IdentityIssue != "" {
+		details = append(details, s.IdentityIssue)
+	}
+	if s.Archived && state != "ARCHIVED" {
+		details = append(details, "archived")
+	}
 	if s.Error != "" {
 		details = append(details, s.Error)
 	}
@@ -706,20 +770,20 @@ func renderStatusGroups(target config.Target, statuses []RepoStatus, showAll boo
 	w.Flush()
 }
 
-func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter) ([]RepoStatus, []RepoTiming, error) {
+func discoverStatusJobs(targets []config.Target, cfg *config.Config) ([]statusJob, []orgKey, error) {
 	var jobs []statusJob
 	var orgKeys []orgKey
 	orgKeySet := make(map[string]bool)
 
 	for _, t := range targets {
-		tok := m.config.Providers[t.Provider].Token
+		tok := cfg.Providers[t.Provider].Token
 		if t.Repo == "" {
 			if _, err := os.Stat(t.Path); os.IsNotExist(err) {
 				return nil, nil, fmt.Errorf("target %q path does not exist: %s", t.Name, t.Path)
 			}
 			entries, err := os.ReadDir(t.Path)
 			if err != nil {
-				continue
+				return nil, nil, fmt.Errorf("reading target %s: %w", t.Path, err)
 			}
 			for _, entry := range entries {
 				if !entry.IsDir() {
@@ -738,7 +802,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 			}
 		} else {
 			parentExists := isGitRepo(t.Path)
-			jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider, token: tok, missing: !parentExists})
+			jobs = append(jobs, statusJob{path: t.Path, target: t.Name, name: t.Repo, org: t.Org, provider: t.Provider, token: tok, missing: !parentExists, fixedPath: true})
 			// foldout
 			if parentExists {
 				fc, err := loadFoldout(t.Path)
@@ -746,6 +810,9 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 					return nil, nil, err
 				}
 				if fc != nil {
+					if err := cleanFoldoutTargets(t.Path, fc.Repos); err != nil {
+						return nil, nil, err
+					}
 					for _, fr := range fc.Repos {
 						dest := filepath.Join(t.Path, fr.Target)
 						parts := strings.Split(fr.Name, "/")
@@ -754,7 +821,7 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 						if len(parts) == 2 {
 							frOrg = parts[0]
 						}
-						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok, missing: !isGitRepo(dest)})
+						jobs = append(jobs, statusJob{path: dest, target: t.Name, name: repoName, org: frOrg, provider: t.Provider, token: tok, missing: !isGitRepo(dest), fixedPath: true})
 						okey := orgKey{provider: t.Provider, org: frOrg}
 						if !orgKeySet[okey.string()] {
 							orgKeys = append(orgKeys, okey)
@@ -772,6 +839,50 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 		}
 	}
 
+	return jobs, orgKeys, nil
+}
+
+func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter) ([]RepoStatus, []RepoTiming, error) {
+	return m.scanStatuses(targets, debug, workers, progress, false)
+}
+
+func (m *Manager) scanStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter, reconcile bool, removeTransferred ...bool) ([]RepoStatus, []RepoTiming, error) {
+	jobs, orgKeys, err := discoverStatusJobs(targets, m.config)
+	if err != nil {
+		return nil, nil, err
+	}
+	index, metadataErrors := m.buildRepoIndex(orgKeys, progress)
+	probe := &historyProbe{progress: progress}
+	defer probe.close()
+	failures := make(map[string]error)
+	if reconcile {
+		originalJobs := jobs
+		for _, t := range targets {
+			key := orgKey{t.Provider, t.Org}.string()
+			if t.Repo != "" || metadataErrors[key] != nil {
+				continue
+			}
+			progress.printf("Reconciling repository identities for %s/%s...\n", t.Provider, t.Org)
+			for path, err := range m.reconcileOrg(t, index[key], probe, false, false, removeTransferred...) {
+				failures[path] = err
+			}
+		}
+		jobs, _, err = discoverStatusJobs(targets, m.config)
+		if err != nil {
+			return nil, nil, err
+		}
+		seen := make(map[string]bool)
+		for _, job := range jobs {
+			seen[job.path] = true
+		}
+		for _, job := range originalJobs {
+			if (failures[job.path] != nil || progress.removed[job.path]) && !seen[job.path] {
+				job.missing = !isGitRepo(job.path)
+				jobs = append(jobs, job)
+				seen[job.path] = true
+			}
+		}
+	}
 	if len(jobs) == 0 {
 		return nil, nil, nil
 	}
@@ -781,12 +892,58 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 		defer progress.checkFinished(job.path)
 		var timing RepoTiming
 		if job.missing {
-			return statusResult{status: RepoStatus{
-				Path: job.path, Target: job.target, Provider: job.provider,
-				Org: job.org, Name: job.name, Missing: true,
-			}}
+			s := m.inspectIdentity(job, index[orgKey{job.provider, job.org}.string()], probe)
+			if err := metadataErrors[orgKey{job.provider, job.org}.string()]; err != nil {
+				s.MetadataError = err.Error()
+			}
+			if err := failures[job.path]; err != nil {
+				s.Error, s.ReconcileError = err.Error(), true
+			}
+			if progress != nil {
+				s.Removed = progress.removed[job.path]
+			}
+			return statusResult{status: s}
 		}
-		status := getRepoStatusWithProgress(job.path, job.target, job.org, job.name, job.provider, job.token, &timing, progress)
+		key := orgKey{job.provider, job.org}.string()
+		identity := RepoStatus{Path: job.path, Target: job.target, Provider: job.provider, Org: job.org, Name: job.name}
+		if metadataErr := metadataErrors[key]; metadataErr != nil {
+			identity.MetadataError = metadataErr.Error()
+		} else {
+			identity = m.inspectIdentity(job, index[key], probe)
+		}
+		if failure := failures[job.path]; failure != nil {
+			identity.Error, identity.ReconcileError = failure.Error(), true
+		}
+		fetch := !hasStatusError(identity) && identity.IdentityIssue == "" && !identity.Orphan
+		if fetch {
+			var err error
+			if progress == nil {
+				err = m.confirmStatusIdentity(identity)
+			} else {
+				err = m.saveVerifiedIdentity(identity)
+			}
+			if err != nil {
+				identity.Error = err.Error()
+				fetch = false
+			}
+		}
+		status := getRepoStatusWithProgressAndFetch(job.path, job.target, job.org, job.name, job.provider, job.token, &timing, progress, fetch)
+		if fetch && status.RemoteError == "" {
+			if err := m.confirmStatusIdentity(identity); err != nil {
+				identity.Error = err.Error()
+			}
+		}
+		status.IdentityIssue, status.RepositoryID, status.RemoteName = identity.IdentityIssue, identity.RepositoryID, identity.RemoteName
+		status.ReplacementID, status.identity, status.repository = identity.ReplacementID, identity.identity, identity.repository
+		status.gitDirInfo = identity.gitDirInfo
+		status.ReconcileError, status.Orphan, status.MetadataError = identity.ReconcileError, identity.Orphan, identity.MetadataError
+		status.Transferred = identity.Transferred
+		if identity.Error != "" {
+			status.Error = identity.Error
+		}
+		if identity.repository != nil {
+			applyRemoteState(&status, *identity.repository)
+		}
 		return statusResult{status: status, timing: timing}
 	})
 
@@ -795,12 +952,6 @@ func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers in
 	for i, r := range results {
 		statuses[i] = r.status
 		timings[i] = r.timing
-	}
-
-	// Mark archived/orphan and retain provider failures on every affected repo.
-	if len(orgKeys) > 0 {
-		index, metadataErrors := m.buildRepoIndex(orgKeys, progress)
-		markRemoteState(statuses, index, metadataErrors)
 	}
 
 	sort.Slice(statuses, func(i, j int) bool {
@@ -878,6 +1029,10 @@ func getRepoStatus(path, target, org, name, provider, token string, timing *Repo
 }
 
 func getRepoStatusWithProgress(path, target, org, name, provider, token string, timing *RepoTiming, progress *progressReporter) RepoStatus {
+	return getRepoStatusWithProgressAndFetch(path, target, org, name, provider, token, timing, progress, true)
+}
+
+func getRepoStatusWithProgressAndFetch(path, target, org, name, provider, token string, timing *RepoTiming, progress *progressReporter, fetch bool) RepoStatus {
 	totalStart := time.Now()
 	status := RepoStatus{
 		Path:     path,
@@ -901,17 +1056,20 @@ func getRepoStatusWithProgress(path, target, org, name, provider, token string, 
 	status.Branch = branch
 	status.Unborn = gitRun(path, "rev-parse", "--verify", "--quiet", "HEAD") != nil
 
-	// Fetch from remote
-	progress.detail("  [DETAIL] %s: git fetch\n", path)
-	fetchStart := time.Now()
-	if fetchErr := gitFetchWithStderr(path, token); fetchErr != "" {
-		status.RemoteError = fetchErr
-	}
-	if timing != nil {
-		timing.Fetch = time.Since(fetchStart)
-	}
-	if status.Unborn && status.RemoteError == "" && !originHasBranches(path) {
-		status.RemoteEmpty = true
+	if fetch {
+		// Fetch from remote
+		progress.detail("  [DETAIL] %s: git fetch\n", path)
+		fetchStart := time.Now()
+		if fetchErr := gitFetchWithStderr(path, token); fetchErr != "" {
+			status.RemoteError = fetchErr
+		}
+		if timing != nil {
+			timing.Fetch = time.Since(fetchStart)
+		}
+		if status.Unborn && status.RemoteError == "" && !originHasBranches(path) {
+			status.RemoteEmpty = true
+		}
+
 	}
 
 	// Check for uncommitted changes
@@ -926,6 +1084,10 @@ func getRepoStatusWithProgress(path, target, org, name, provider, token string, 
 		return status
 	}
 	status.Dirty = strings.TrimSpace(dirtyOutput) != ""
+
+	if !fetch {
+		return status
+	}
 
 	// Get ahead/behind counts
 	progress.detail("  [DETAIL] %s: counting ahead/behind commits\n", path)
@@ -1222,38 +1384,6 @@ func switchToDefaultBranch(repoPath, branch, defaultBranch string) error {
 	return nil
 }
 
-// markRemoteState annotates archived/orphan based on remote index.
-func markRemoteState(statuses []RepoStatus, index map[string]map[string]remote.Repository, metadataErrors map[string]error) {
-	for i := range statuses {
-		key := orgKey{provider: statuses[i].Provider, org: statuses[i].Org}.string()
-		if err, ok := metadataErrors[key]; ok {
-			statuses[i].MetadataError = err.Error()
-			continue
-		}
-		repos, ok := index[key]
-		if !ok {
-			statuses[i].MetadataError = "repository metadata unavailable"
-			continue
-		}
-		if r, ok := repos[statuses[i].Name]; ok {
-			statuses[i].Archived = r.Archived
-			statuses[i].DefaultBranch = r.DefaultBranch
-			statuses[i].RemoteEmpty = r.Empty
-			if r.Empty {
-				statuses[i].Behind = 0
-				statuses[i].UpstreamGone = false
-				if statuses[i].Unborn {
-					statuses[i].Ahead = 0
-				} else if statuses[i].LocalCommits > 0 {
-					statuses[i].Ahead = statuses[i].LocalCommits
-				}
-			}
-		} else if !statuses[i].Missing {
-			statuses[i].Orphan = true
-		}
-	}
-}
-
 func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoStatus, bool, error) {
 	defaultBranch := strings.TrimSpace(s.DefaultBranch)
 	if defaultBranch != "" && s.Branch == defaultBranch {
@@ -1284,6 +1414,8 @@ func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoS
 		refreshed.DefaultBranch = defaultBranch
 		refreshed.Archived = s.Archived
 		refreshed.Orphan = s.Orphan
+		refreshed.gitDirInfo = s.gitDirInfo
+		refreshed.identity, refreshed.repository, refreshed.RepositoryID, refreshed.RemoteName = s.identity, s.repository, s.RepositoryID, s.RemoteName
 		return refreshed, true, nil
 	}
 	if s.Ahead > 0 {
@@ -1298,6 +1430,8 @@ func (m *Manager) prepareRepoForDefaultBranch(s RepoStatus, token string) (RepoS
 	refreshed.DefaultBranch = defaultBranch
 	refreshed.Archived = s.Archived
 	refreshed.Orphan = s.Orphan
+	refreshed.gitDirInfo = s.gitDirInfo
+	refreshed.identity, refreshed.repository, refreshed.RepositoryID, refreshed.RemoteName = s.identity, s.repository, s.RepositoryID, s.RemoteName
 	return refreshed, true, nil
 }
 
@@ -1428,19 +1562,35 @@ func verifyOriginMatches(repoPath string, repository *remote.Repository) error {
 }
 
 func (m *Manager) confirmArchivedRepository(s RepoStatus) (*remote.Repository, error) {
+	if s.identity == nil || s.RepositoryID <= 0 || s.identity.Pending != nil || s.IdentityIssue != "" {
+		return nil, archiveSkip("repository identity is unresolved or a replacement is pending")
+	}
+	if err := confirmCheckoutDirectory(s); err != nil {
+		return nil, err
+	}
+	stored, err := readIdentity(s.Path)
+	if err != nil {
+		return nil, err
+	}
+	if stored == nil || stored.RepositoryID != s.RepositoryID || stored.Pending != nil || stored.ProviderType != s.identity.ProviderType || stored.APIURL != s.identity.APIURL {
+		return nil, archiveSkip("local repository identity changed or a replacement is pending")
+	}
 	client, ok := m.providers[s.Provider]
 	if !ok {
 		return nil, fmt.Errorf("no client for provider %s", s.Provider)
 	}
-	repository, err := client.GetRepo(s.Org, s.Name)
+	repository, err := client.GetRepo(s.Org, s.RemoteName)
 	if err != nil {
 		return nil, fmt.Errorf("checking archive state for %s/%s: %w", s.Org, s.Name, err)
 	}
 	if repository == nil {
 		return nil, fmt.Errorf("provider repository %s/%s no longer exists", s.Org, s.Name)
 	}
-	if repository.FullName != "" && !strings.EqualFold(repository.FullName, s.Org+"/"+s.Name) {
+	if repository.FullName != "" && !strings.EqualFold(repository.FullName, s.Org+"/"+s.RemoteName) {
 		return nil, fmt.Errorf("provider returned unexpected repository %s", repository.FullName)
+	}
+	if repository.ID != s.RepositoryID {
+		return nil, fmt.Errorf("provider identity changed before archive removal")
 	}
 	if !repository.Archived {
 		return nil, archiveSkip("repository is no longer archived")
@@ -1739,6 +1889,11 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 			failed++
 			continue
 		}
+		if s.IdentityIssue != "" || s.Orphan {
+			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
+			skipped++
+			continue
+		}
 		if s.Archived {
 			progress.finish("  [SKIP]  %s: archived\n", s.Path)
 			skipped++
@@ -1754,6 +1909,11 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 			continue
 		}
 
+		if err := m.confirmStatusIdentity(s); err != nil {
+			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
+			continue
+		}
 		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
 		if err != nil {
 			var skipErr *updateSkipError
@@ -1767,7 +1927,8 @@ func (m *Manager) Pull(targetNames []string, workers int) error {
 			continue
 		}
 		if switched {
-			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
+			progress.note(s.Path, "switched "+s.Branch+" -> "+prepared.DefaultBranch)
+			progress.detail("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
 		}
 		if hasStatusError(prepared) {
 			progress.finish("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
@@ -1830,6 +1991,11 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 			skipped++
 			continue
 		}
+		if s.IdentityIssue != "" || s.Orphan {
+			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
+			skipped++
+			continue
+		}
 		if s.Archived {
 			progress.finish("  [SKIP]  %s: archived\n", s.Path)
 			skipped++
@@ -1847,6 +2013,11 @@ func (m *Manager) Push(targetNames []string, workers int) error {
 		}
 		if s.Ahead == 0 {
 			progress.finish("  [OK]    %s: nothing to push\n", s.Path)
+			continue
+		}
+		if err := m.confirmStatusIdentity(s); err != nil {
+			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
 			continue
 		}
 		if err := gitPush(s.Path, tokenMap[s.Target]); err != nil {
@@ -1868,7 +2039,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	}
 	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
 	progress.printf("Sync: discovering repositories...\n")
-	statuses, _, err := m.getAllStatuses(targets, false, runOpts.Workers, progress)
+	statuses, _, err := m.scanStatuses(targets, false, runOpts.Workers, progress, true, runOpts.RemoveArchived)
 	if err != nil {
 		return err
 	}
@@ -1885,9 +2056,18 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 
 	var archivedStatuses []RepoStatus
 	var synced, removed, skipped, failed int
+	reconcileFailed := false
+	for _, s := range statuses {
+		reconcileFailed = reconcileFailed || s.ReconcileError
+	}
 	for _, s := range statuses {
 		if !(s.Archived && runOpts.RemoveArchived && !hasStatusError(s) && !s.Missing) {
 			progress.detail("  [START] %s: sync\n", s.Path)
+		}
+		if s.Removed {
+			progress.finish("  [REMOVE] %s: transferred checkout safely removed\n", s.Path)
+			removed++
+			continue
 		}
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
@@ -1899,6 +2079,11 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		}
 		if s.Missing {
 			progress.finish("  [SKIP]  %s: missing\n", s.Path)
+			skipped++
+			continue
+		}
+		if s.IdentityIssue != "" || s.Orphan {
+			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
 			skipped++
 			continue
 		}
@@ -1916,6 +2101,11 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			skipped++
 			continue
 		}
+		if err := m.confirmStatusIdentity(s); err != nil {
+			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+			failed++
+			continue
+		}
 		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
 		if err != nil {
 			var skipErr *updateSkipError
@@ -1929,7 +2119,8 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			continue
 		}
 		if switched {
-			fmt.Printf("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
+			progress.note(s.Path, "switched "+s.Branch+" -> "+prepared.DefaultBranch)
+			progress.detail("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
 		}
 		if hasStatusError(prepared) {
 			progress.finish("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
@@ -1945,14 +2136,14 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		if prepared.Behind > 0 {
 			if !prepared.CanFastForward && opts.Sync.GetFFOnly() {
 				// Diverged: ff-only would fail, go straight to rebase.
-				fmt.Printf("  [REBASE] %s: %d behind, %d ahead (diverged)\n", prepared.Path, prepared.Behind, prepared.Ahead)
+				progress.detail("  [REBASE] %s: %d behind, %d ahead (diverged)\n", prepared.Path, prepared.Behind, prepared.Ahead)
 				if err := gitPullRebase(prepared.Path, tok); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 					failed++
 					continue
 				}
 			} else {
-				fmt.Printf("  [PULL]  %s: %d behind\n", prepared.Path, prepared.Behind)
+				progress.detail("  [PULL]  %s: %d behind\n", prepared.Path, prepared.Behind)
 				if err := gitPull(prepared.Path, opts.Sync.GetFFOnly(), tok); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 					failed++
@@ -1961,7 +2152,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			}
 		}
 		if prepared.Ahead > 0 {
-			fmt.Printf("  [PUSH]  %s: %d ahead\n", prepared.Path, prepared.Ahead)
+			progress.detail("  [PUSH]  %s: %d ahead\n", prepared.Path, prepared.Ahead)
 			if err := gitPush(prepared.Path, tok); err != nil {
 				progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 				failed++
@@ -2001,7 +2192,8 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			continue
 		}
 		if fastForwarded {
-			fmt.Printf("  [PULL]  %s: fast-forwarded archived default branch\n", s.Path)
+			progress.note(s.Path, "fast-forwarded archived default branch")
+			progress.detail("  [PULL]  %s: fast-forwarded archived default branch\n", s.Path)
 		}
 		progress.finish("  [REMOVE] %s: archived checkout removed\n", s.Path)
 		removed++
@@ -2015,6 +2207,9 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		return nil
 	}
 	fmt.Printf("Sync complete: %d synced, %d skipped, %d failed\n", synced, skipped, failed)
+	if reconcileFailed {
+		return fmt.Errorf("sync completed with reconciliation errors")
+	}
 	return nil
 }
 
@@ -2023,91 +2218,94 @@ func (m *Manager) List(targetNames []string, includeArchived bool, workers int) 
 	if err != nil {
 		return err
 	}
-
+	probe := &historyProbe{}
+	defer probe.close()
 	for _, t := range targets {
 		fmt.Printf("Target: %s (%s/%s) path=%s\n", t.Name, t.Provider, t.Org, t.Path)
+		var jobs []statusJob
+		orgs := []orgKey{{t.Provider, t.Org}}
 		if t.Repo == "" {
-			client, ok := m.providers[t.Provider]
-			if !ok {
-				fmt.Printf("  [ERROR] no client for provider %s\n\n", t.Provider)
-				continue
+			entries, err := os.ReadDir(t.Path)
+			if err != nil && !os.IsNotExist(err) {
+				return err
 			}
-
-			remoteMap := make(map[string]remote.Repository)
-			if repos, err := client.ListOrgRepos(t.Org); err == nil {
-				for _, r := range repos {
-					remoteMap[r.Name] = r
-				}
-			} else {
-				fmt.Printf("  [ERROR] listing org: %v\n", err)
-			}
-
-			local := make(map[string]bool)
-			entries, _ := os.ReadDir(t.Path)
-			for _, e := range entries {
-				if e.IsDir() && isGitRepo(filepath.Join(t.Path, e.Name())) {
-					local[e.Name()] = true
+			for _, entry := range entries {
+				dir := filepath.Join(t.Path, entry.Name())
+				if entry.IsDir() && isGitRepo(dir) {
+					jobs = append(jobs, statusJob{path: dir, target: t.Name, provider: t.Provider, org: t.Org, name: entry.Name()})
 				}
 			}
-
-			names := make([]string, 0, len(remoteMap))
-			for n := range remoteMap {
-				names = append(names, n)
-			}
-			sort.Strings(names)
-
-			for _, n := range names {
-				r := remoteMap[n]
-				// Skip archived repos unless --include-archived is set
-				if r.Archived && !includeArchived {
-					continue
-				}
-				mark := "[ ]"
-				if local[n] {
-					mark = "[x]"
-				}
-				flags := []string{}
-				if r.Archived {
-					flags = append(flags, "archived")
-				}
-				fmt.Printf("  %s %s", mark, n)
-				if len(flags) > 0 {
-					fmt.Printf(" (%s)", strings.Join(flags, ", "))
-				}
-				fmt.Println()
-			}
-
-			// local only -> orphan
-			var orphans []string
-			for n := range local {
-				if _, ok := remoteMap[n]; !ok {
-					orphans = append(orphans, n)
-				}
-			}
-			sort.Strings(orphans)
-			for _, n := range orphans {
-				fmt.Printf("  [x] %s (orphan)\n", n)
-			}
-
 		} else {
-			mark := "[ ]"
-			if isGitRepo(t.Path) {
-				mark = "[x]"
-			}
-			fmt.Printf("  %s %s\n", mark, t.Repo)
-			fc, err := loadFoldout(t.Path)
+			var err error
+			jobs, orgs, err = discoverStatusJobs([]config.Target{t}, m.config)
 			if err != nil {
 				return err
 			}
-			if fc != nil {
-				for _, fr := range fc.Repos {
-					dest := filepath.Join(t.Path, fr.Target)
-					m := "[ ]"
-					if isGitRepo(dest) {
-						m = "[x]"
-					}
-					fmt.Printf("  %s %s -> %s\n", m, fr.Name, fr.Target)
+		}
+		index, metadataErrors := m.buildRepoIndex(orgs, nil)
+		var local []RepoStatus
+		for _, job := range jobs {
+			job.token = m.config.Providers[t.Provider].Token
+			if err := metadataErrors[orgKey{job.provider, job.org}.string()]; err != nil {
+				local = append(local, RepoStatus{Name: job.name, Path: job.path, Error: err.Error()})
+			} else {
+				local = append(local, m.inspectIdentity(job, index[orgKey{job.provider, job.org}.string()], probe))
+			}
+		}
+		if t.Repo == "" {
+			if err := metadataErrors[orgKey{t.Provider, t.Org}.string()]; err != nil {
+				fmt.Printf("  [ERROR] listing org: %v\n", err)
+			}
+			var names []string
+			for name := range index[orgKey{t.Provider, t.Org}.string()] {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				r := index[orgKey{t.Provider, t.Org}.string()][name]
+				mark := "[ ]"
+				var flags []string
+				if r.Archived {
+					flags = append(flags, "archived")
 				}
+				attention := false
+				for _, s := range local {
+					if s.RepositoryID == r.ID && !hasStatusError(s) {
+						mark = "[x]"
+						if s.IdentityIssue != "" {
+							flags = append(flags, "at "+s.Name+": "+s.IdentityIssue)
+							attention = true
+						}
+					} else if s.Name == name {
+						flags = append(flags, "local path occupied; "+s.IdentityIssue+statusErrorMessage(s))
+						attention = true
+					}
+				}
+				if r.Archived && !includeArchived && !attention {
+					continue
+				}
+				fmt.Printf("  %s %s", mark, name)
+				if len(flags) > 0 {
+					fmt.Printf(" (%s)", strings.Join(flags, "; "))
+				}
+				fmt.Println()
+			}
+			for _, s := range local {
+				if _, named := index[orgKey{t.Provider, t.Org}.string()][s.Name]; !named && (s.RepositoryID == 0 || hasStatusError(s) || s.Orphan) {
+					fmt.Printf("  [x] %s (orphan; %s%s)\n", s.Name, s.IdentityIssue, statusErrorMessage(s))
+				}
+			}
+		} else {
+			for _, s := range local {
+				mark := "[ ]"
+				if !s.Missing && s.RepositoryID != 0 && s.RemoteName == s.Name && s.IdentityIssue == "" && !hasStatusError(s) {
+					mark = "[x]"
+				}
+				fmt.Printf("  %s %s -> %s", mark, s.Name, s.Path)
+				if s.IdentityIssue != "" || hasStatusError(s) {
+					fmt.Printf(" (%s%s)", s.IdentityIssue, statusErrorMessage(s))
+				}
+				fmt.Println()
 			}
 		}
 		fmt.Println()

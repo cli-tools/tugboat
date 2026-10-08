@@ -29,8 +29,9 @@ func TestCloneExclusionsMatchNamesAndStayWithinTarget(t *testing.T) {
 		{"app", ""},
 	}
 	repos := make(map[string]remote.Repository)
-	for _, tc := range cases {
+	for i, tc := range cases {
 		r := remoteRepo(seed)
+		r.ID = int64(i + 1)
 		r.Name, r.FullName = tc.name, "t1/"+tc.name
 		repos[tc.name] = r
 	}

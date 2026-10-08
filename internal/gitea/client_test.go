@@ -21,6 +21,23 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
+func TestArchiveSearchIncludesTransferredIdentities(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/repos/search" || r.URL.Query().Get("archived") != "true" || r.Header.Get("Authorization") != "token test-token" {
+			t.Errorf("unexpected archive request: %s", r.URL)
+		}
+		json.NewEncoder(w).Encode(struct {
+			OK   bool         `json:"ok"`
+			Data []Repository `json:"data"`
+		}{true, []Repository{{ID: 33, Name: "perception-yolo", FullName: "t1-archive/perception-yolo", Archived: true}, {ID: 187, Name: "perception", FullName: "t1/perception"}}})
+	}))
+	defer server.Close()
+	repos, err := NewClient(server.URL, "test-token").ListArchivedRepos()
+	if err != nil || len(repos) != 1 || repos[0].ID != 33 || repos[0].FullName != "t1-archive/perception-yolo" {
+		t.Fatalf("archive identities: %+v, %v", repos, err)
+	}
+}
+
 func TestNewClientTrimsTrailingSlash(t *testing.T) {
 	client := NewClient("https://gitea.example.com/", "test-token")
 
@@ -63,6 +80,9 @@ func TestListOrgRepos(t *testing.T) {
 	if result[0].Name != "repo1" {
 		t.Errorf("result[0].Name = %q, want %q", result[0].Name, "repo1")
 	}
+	if result[0].ID != 1 || result[1].ID != 2 {
+		t.Fatalf("provider repository IDs were not preserved: %+v", result)
+	}
 }
 
 func TestListOrgReposAPIError(t *testing.T) {
@@ -102,6 +122,9 @@ func TestGetRepo(t *testing.T) {
 
 	if result.Name != "testrepo" {
 		t.Errorf("result.Name = %q, want %q", result.Name, "testrepo")
+	}
+	if result.ID != 1 {
+		t.Fatalf("provider repository ID = %d, want 1", result.ID)
 	}
 
 	if result.DefaultBranch != "main" {

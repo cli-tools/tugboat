@@ -2,6 +2,7 @@ package repo
 
 import (
 	"errors"
+	"hash/fnv"
 	"io"
 	"os"
 	"os/exec"
@@ -136,7 +137,7 @@ func TestSyncPullsFirstRemoteCommitIntoUnbornRepository(t *testing.T) {
 		}
 	})
 
-	if !strings.Contains(output, "[PULL]  "+repo.workPath+": 1 behind") {
+	if !strings.Contains(output, "[SYNC]  "+repo.workPath) {
 		t.Fatalf("expected initial remote commit to be pulled, got:\n%s", output)
 	}
 	if data, err := os.ReadFile(filepath.Join(repo.workPath, "README.md")); err != nil || string(data) != "first\n" {
@@ -184,7 +185,7 @@ func TestPullSwitchesCleanPushedFeatureBranchToDefault(t *testing.T) {
 	if branch := currentBranch(t, repo.workPath); branch != "main" {
 		t.Fatalf("current branch = %q, want %q", branch, "main")
 	}
-	if !strings.Contains(output, "[SWITCH] "+repo.workPath+": feature/clean -> main") {
+	if !strings.Contains(output, "switched feature/clean -> main") {
 		t.Fatalf("expected switch output, got:\n%s", output)
 	}
 }
@@ -285,10 +286,10 @@ func TestSyncSwitchesThenPullsDefaultBranch(t *testing.T) {
 	if string(data) != "from remote\n" {
 		t.Fatalf("remote.txt = %q, want %q", string(data), "from remote\n")
 	}
-	if !strings.Contains(output, "[SWITCH] "+repo.workPath+": feature/clean -> main") {
+	if !strings.Contains(output, "switched feature/clean -> main") {
 		t.Fatalf("expected switch output, got:\n%s", output)
 	}
-	if !strings.Contains(output, "[PULL]  "+repo.workPath+": 1 behind") {
+	if !strings.Contains(output, "[SYNC]  "+repo.workPath) {
 		t.Fatalf("expected pull output, got:\n%s", output)
 	}
 }
@@ -312,7 +313,7 @@ func TestPullSwitchesWhenUpstreamGoneAndBranchContainedInDefault(t *testing.T) {
 	if branch := currentBranch(t, repo.workPath); branch != "main" {
 		t.Fatalf("current branch = %q, want %q", branch, "main")
 	}
-	if !strings.Contains(output, "[SWITCH] "+repo.workPath+": feature/done -> main") {
+	if !strings.Contains(output, "switched feature/done -> main") {
 		t.Fatalf("expected switch output, got:\n%s", output)
 	}
 }
@@ -386,7 +387,7 @@ func TestPullUsesRemoteDefaultBranchMetadataForCrossOrgFoldout(t *testing.T) {
 	if branch := currentBranch(t, child.workPath); branch != "main" {
 		t.Fatalf("child current branch = %q, want %q", branch, "main")
 	}
-	if !strings.Contains(output, "[SWITCH] "+child.workPath+": feature/foldout -> main") {
+	if !strings.Contains(output, "switched feature/foldout -> main") {
 		t.Fatalf("expected foldout switch output, got:\n%s", output)
 	}
 }
@@ -403,7 +404,8 @@ func TestPullUsesCurrentBranchWhenDefaultBranchCannotBeResolved(t *testing.T) {
 	runGit(t, repo.workPath, "update-ref", "-d", "refs/remotes/origin/HEAD")
 
 	target := repoTarget(repo)
-	manager := newTestManager([]config.Target{target}, fakeClient{})
+	repo.defaultBranch = ""
+	manager := newTestManager([]config.Target{target}, fakeClientForRepos(repo))
 	output := captureStdout(t, func() {
 		if err := manager.Pull(nil, 1); err != nil {
 			t.Fatalf("Pull() error = %v", err)
@@ -622,7 +624,7 @@ func TestSyncFastForwardsThenRemovesArchivedRepo(t *testing.T) {
 			t.Fatalf("Sync() error = %v", err)
 		}
 	})
-	if !strings.Contains(output, "[PULL]  "+repo.workPath+": fast-forwarded archived default branch") {
+	if !strings.Contains(output, "archived checkout removed; fast-forwarded archived default branch") {
 		t.Fatalf("expected archived fast-forward, got:\n%s", output)
 	}
 	if _, err := os.Stat(repo.workPath); !os.IsNotExist(err) {
@@ -788,7 +790,7 @@ func TestArchivedRemovalProcessesFoldoutsBeforeParent(t *testing.T) {
 	if _, err := os.Stat(parent.workPath); !os.IsNotExist(err) {
 		t.Fatalf("parent checkout still exists: %v\n%s", err, output)
 	}
-	assertProgressCounts(t, output, 2)
+	assertProgressCounts(t, output, 2, true)
 	childResult := "[1/2] [REMOVE] " + child.workPath
 	parentStart := "[START] " + parent.workPath + ":"
 	parentResult := "[2/2] [REMOVE] " + parent.workPath
@@ -881,7 +883,10 @@ func fakeClientForRepos(repos ...testRepo) fakeClient {
 }
 
 func remoteRepo(repo testRepo) remote.Repository {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(repo.remotePath))
 	return remote.Repository{
+		ID:            int64(h.Sum64()>>1) + 1,
 		Name:          repo.name,
 		FullName:      repo.org + "/" + repo.name,
 		CloneURL:      repo.remotePath,

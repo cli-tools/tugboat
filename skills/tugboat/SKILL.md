@@ -49,7 +49,7 @@ tugboat version               # Show version
 - `--pull` - Clone missing repos and pull without pushing
 - `--push` - Push existing repos without cloning, pulling, or switching branches
 - `--clone-only` - Clone and reconcile without updating branches
-- Direction switches are mutually exclusive; standalone `clone`, `pull`, and `push` commands are removed in v0.9.1. Update scripts to use the corresponding sync switches.
+- Direction switches are mutually exclusive; standalone `clone`, `pull`, and `push` commands are removed in v0.10.0. Update scripts to use the corresponding sync switches.
 - `-w, --workers N` - Parallel workers (default: CPU cores)
 - `-d, --debug` - Show timing info (status only)
 - `--verbose` - Show provider metadata, reconciliation, identity downloads, check completions, Git operations, and update-start messages (sync). Default output has the initial sync line, one final result per repository as it completes, and the summary, numbered `[done/total]`. Known local and remote checkout paths are counted up front; the total adjusts for renames and newly discovered foldouts. Verified checkouts update before slower identity reconciliation; cloning also reports incrementally.

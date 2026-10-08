@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.9.1
+VERSION=v0.10.0
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -88,7 +88,7 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 - `migrate`, `help`, `version`
 
 `--pull`, `--push`, and `--clone-only` are mutually exclusive. The former
-standalone `clone`, `pull`, and `push` commands have been removed in v0.9.1.
+standalone `clone`, `pull`, and `push` commands have been removed in v0.10.0.
 Update scripts using those commands to use the corresponding sync switches.
 
 Sync checks and updates repositories incrementally, printing one numbered final
@@ -264,11 +264,11 @@ pending changes and retain ordinary cloning and update commands.
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.9.1 binary with:
+For Codex, install the skill matching the v0.10.0 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.9.1
+SKILL_VERSION=v0.10.0
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

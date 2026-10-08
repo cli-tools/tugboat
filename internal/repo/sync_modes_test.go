@@ -8,7 +8,36 @@ import (
 	"testing"
 
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
+	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
 )
+
+func TestReceivingSyncAcceptsCanonicalOrganizationCasing(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprint(explicit), func(t *testing.T) {
+			base := t.TempDir()
+			r := createTestRepo(t, base, "acme", "app", "main", filepath.Join(base, "seed"))
+			client := fakeClient{repos: map[string]map[string]remote.Repository{
+				"ACME": {"app": remoteRepo(r)}, "acme": {"app": remoteRepo(r)},
+			}}
+			target := config.Target{Name: "app", Provider: "fake", Org: "ACME", Path: filepath.Join(base, "work")}
+			dir := filepath.Join(target.Path, "app")
+			if explicit {
+				target.Repo = "app"
+				dir = target.Path
+			}
+			m := newTestManager([]config.Target{target}, client)
+			output := captureStdout(t, func() {
+				if err := m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if !isGitRepo(dir) || strings.Contains(output, "configured repository moved") {
+				t.Fatalf("valid owner casing did not clone: %s", output)
+			}
+			assertProgressCounts(t, output, 1)
+		})
+	}
+}
 
 func TestReceivingSyncClonesMissingRepositories(t *testing.T) {
 	for _, mode := range []SyncMode{SyncBoth, SyncPull} {

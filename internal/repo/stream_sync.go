@@ -3,6 +3,7 @@ package repo
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
@@ -43,6 +44,7 @@ func (m *Manager) streamSync(targets []config.Target, opts SyncOptions, progress
 	if err != nil {
 		return err
 	}
+	initialJobs := jobs
 	metadata := &scanMetadata{}
 	metadata.index, metadata.errors = m.buildRepoIndex(orgs, progress)
 	progress.beginPlan(plannedSyncPaths(targets, jobs, metadata, opts.Mode))
@@ -96,7 +98,7 @@ func (m *Manager) streamSync(targets []config.Target, opts SyncOptions, progress
 				scan(job, failure, probe, func(s RepoStatus) {
 					if s.IdentityIssue != "" || hasStatusError(s) {
 						reserve(dir)
-						if s.repository != nil && repositoryOwner(*s.repository, t.Org) == t.Org {
+						if s.repository != nil && strings.EqualFold(repositoryOwner(*s.repository, t.Org), t.Org) {
 							reserve(filepath.Join(t.Path, s.repository.Name))
 						}
 						if s.identity != nil && s.identity.Pending != nil {
@@ -136,8 +138,19 @@ func (m *Manager) streamSync(targets []config.Target, opts SyncOptions, progress
 	if err != nil {
 		return err
 	}
+	currentPaths := make(map[string]bool, len(jobs))
 	for _, job := range jobs {
+		currentPaths[job.path] = true
 		progress.plan(job.path)
+	}
+	// A parent update can withdraw a missing foldout before it is cloned. Give
+	// that originally planned checkout a terminal result rather than leaving
+	// the progress total with work that can no longer run.
+	for _, job := range initialJobs {
+		if job.fixedPath && job.missing && !currentPaths[job.path] && !done(job.path) {
+			progress.note(job.path, "foldout declaration removed by parent update")
+			process(RepoStatus{Path: job.path, Target: job.target, Provider: job.provider, Org: job.org, Name: job.name, Missing: true})
+		}
 	}
 	var missing []orgKey
 	for _, org := range orgs {

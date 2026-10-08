@@ -421,7 +421,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 			}
 			if redirected != nil {
 				current, ok := repos[redirected.Name]
-				if ok && current.ID == redirected.ID && current.ID > 0 && repositoryOwner(*redirected, job.org) == job.org && originMatches(origin, withRepoName(current, job.name)) {
+				if ok && current.ID == redirected.ID && current.ID > 0 && strings.EqualFold(repositoryOwner(*redirected, job.org), job.org) && originMatches(origin, withRepoName(current, job.name)) {
 					upstream, hasUpstream = current, true
 					found := false
 					for _, candidate := range candidates {

@@ -18,7 +18,7 @@ func (m *Manager) removeRenamedDuplicate(t config.Target, s RepoStatus, repos ma
 	}
 	r := *s.repository
 	dest := filepath.Join(t.Path, r.Name)
-	if r.Name == s.Name || repositoryOwner(r, t.Org) != t.Org {
+	if r.Name == s.Name || !strings.EqualFold(repositoryOwner(r, t.Org), t.Org) {
 		return archiveSkip("not an obsolete renamed checkout")
 	}
 	unlock, err := lockCheckout(s.Path)

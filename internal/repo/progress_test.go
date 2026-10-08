@@ -489,3 +489,27 @@ func TestProgressTotalAdjustsWithoutRepeatingResults(t *testing.T) {
 	}
 	assertProgressCounts(t, output.String(), 3)
 }
+
+func TestSyncReportsWithdrawnMissingFoldout(t *testing.T) {
+	base := t.TempDir()
+	parent := createTestRepo(t, base, "acme", "parent", "main", filepath.Join(base, "parent"))
+	child := createTestRepo(t, base, "acme", "child", "main", filepath.Join(base, "seed-child"))
+	commitFile(t, parent.workPath, ".tugboat.json", `{"repos":[{"name":"acme/child","target":"child"}]}`, "declare foldout")
+	runGit(t, parent.workPath, "push", "origin", "main")
+	seed := cloneRepo(t, parent.remotePath, filepath.Join(base, "seed-parent"))
+	commitFile(t, seed, ".tugboat.json", `{"repos":[]}`, "remove foldout")
+	runGit(t, seed, "push", "origin", "main")
+	m := newTestManager([]config.Target{repoTarget(parent)}, fakeClientForRepos(parent, child))
+	output := captureStdout(t, func() {
+		if err := m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	assertProgressCounts(t, output, 2)
+	if !strings.Contains(output, "[2/2] [SKIP]  "+filepath.Join(parent.workPath, "child")+": missing; foldout declaration removed by parent update") {
+		t.Fatalf("missing terminal result for withdrawn foldout: %s", output)
+	}
+	if isGitRepo(filepath.Join(parent.workPath, "child")) {
+		t.Fatal("withdrawn missing foldout was cloned")
+	}
+}

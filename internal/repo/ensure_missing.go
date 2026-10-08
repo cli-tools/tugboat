@@ -55,7 +55,7 @@ func (m *Manager) ensureMissingCheckouts(targets []config.Target, workers int, p
 			return
 		}
 		progress.plan(dir)
-		if repositoryOwner(r, org) != org || r.Name != name {
+		if !strings.EqualFold(repositoryOwner(r, org), org) || r.Name != name {
 			progress.note(dir, "configured repository moved to "+r.FullName+"; update its declaration")
 			addExtra(RepoStatus{Path: dir, Target: t.Name, Provider: t.Provider, Org: org, Name: name, Missing: true})
 			return

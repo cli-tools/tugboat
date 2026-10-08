@@ -9,6 +9,7 @@
 - Recognize old-name redirects to active repositories using provider identity and matching history. `--remove-archived` can remove an obsolete renamed duplicate when a separate verified canonical checkout exists and all local refs are published.
 - Report cleanup blockers as `[SKIP]` and reserve `[ERROR]` and failure exit status for operational failures. Name unpublished branches, tags, stash, or detached HEAD with a commit count, so users can find the local work that prevents removal.
 - Ignore stale remote-tracking caches and missing, unlocked, prunable branch worktree registrations during cleanup. Continue protecting their local branch commits, and allow unrelated missing repos to clone when reconciliation is blocked.
+- Accept organization names whose casing differs from the provider's canonical name. Report a missing foldout removed by a parent update as skipped, so progress still finishes at its total.
 
 ## v0.9.0 - 2026-10-08
 

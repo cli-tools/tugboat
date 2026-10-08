@@ -10,8 +10,8 @@ import (
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
 )
 
-// Transfers leave maintenance. Only explicit archived cleanup may discard the
-// old checkout, with the same guards as ordinary archived cleanup. Prepare any
+// Archived transfers leave maintenance and may be discarded during receiving
+// sync, with the same guards as ordinary archived cleanup. Prepare any
 // replacement first so clone failures cannot destroy the original checkout.
 func (m *Manager) removeTransferredCheckout(t config.Target, s RepoStatus, repos map[string]remote.Repository, probe *historyProbe) error {
 	if s.repository == nil || s.identity == nil || !s.Archived || s.identity.Pending != nil {
@@ -77,8 +77,8 @@ func (m *Manager) removeTransferredCheckout(t config.Target, s RepoStatus, repos
 	if err != nil {
 		return err
 	}
-	if localOnly > 0 {
-		return archiveSkip(fmt.Sprintf("contains %d local-only commits", localOnly))
+	if localOnly.count > 0 {
+		return archiveSkip(localOnly.reason())
 	}
 
 	var holder, staged string

@@ -3,11 +3,13 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/repo"
 )
 
 func TestParseSyncArgs(t *testing.T) {
-	removeArchived, targets := parseSyncArgs([]string{"one", "--remove-archived", "two"})
-	if !removeArchived {
+	opts, targets, err := parseSyncArgs([]string{"one", "--remove-archived", "two"})
+	if err != nil || !opts.RemoveArchived {
 		t.Fatal("--remove-archived was not parsed")
 	}
 	if want := []string{"one", "two"}; !reflect.DeepEqual(targets, want) {
@@ -39,5 +41,29 @@ func TestParseVerbose(t *testing.T) {
 	verbose, targets := parseVerbose([]string{"t1"})
 	if verbose || !reflect.DeepEqual(targets, []string{"t1"}) {
 		t.Fatalf("unexpected default: %v %v", verbose, targets)
+	}
+}
+
+func TestSyncDirectionsAndInvalidCombinations(t *testing.T) {
+	for _, args := range [][]string{
+		{"--pull", "--push"}, {"--clone-only", "--pull"}, {"--push", "--clone-only"},
+		{"--push", "--remove-archived"}, {"--clone-only", "--remove-archived"},
+		{"--pull", "-E"}, {"-a"}, {"--unknown"},
+	} {
+		if _, _, err := parseSyncArgs(args); err == nil {
+			t.Errorf("accepted invalid options %v", args)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		mode repo.SyncMode
+	}{
+		{[]string{"t1"}, repo.SyncBoth}, {[]string{"--pull", "t1"}, repo.SyncPull},
+		{[]string{"t1", "--push"}, repo.SyncPush}, {[]string{"--clone-only", "-E", "-a", "t1"}, repo.SyncCloneOnly},
+	} {
+		opts, targets, err := parseSyncArgs(tc.args)
+		if err != nil || opts.Mode != tc.mode || !reflect.DeepEqual(targets, []string{"t1"}) {
+			t.Fatalf("parse %v: %+v %v %v", tc.args, opts, targets, err)
+		}
 	}
 }

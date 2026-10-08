@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Replace standalone `clone`, `pull`, and `push` with `sync --clone-only`, `sync --pull`, and `sync --push`. Direction switches are mutually exclusive. Default sync and pull-only sync also clone missing active repos, honoring organization exclusions and foldouts.
+- Keep pull-only sync from pushing local commits. Push-only sync never clones, pulls, or switches branches.
+- Check and update repos incrementally, with one final `[done/total]` result per repo in completion order. Count known checkout paths up front and adjust the total for renames and new foldouts. Show metadata and reconciliation diagnostics only with `--verbose`.
+- Automatically remove safe archived transfers out of the target organization during receiving sync, preparing replacements before deletion. Local work, stashes, and live, locked, or detached worktrees prevent removal.
+- Recognize old-name redirects to active repositories using provider identity and matching history. `--remove-archived` can remove an obsolete renamed duplicate when a separate verified canonical checkout exists and all local refs are published.
+- Report cleanup blockers as `[SKIP]` and reserve `[ERROR]` and failure exit status for operational failures. Name unpublished branches, tags, stash, or detached HEAD with a commit count, so users can find the local work that prevents removal.
+- Ignore stale remote-tracking caches and missing, unlocked, prunable branch worktree registrations during cleanup. Continue protecting their local branch commits, and allow unrelated missing repos to clone when reconciliation is blocked.
+
 ## v0.9.0 - 2026-10-08
 
 - Track provider repository IDs before fetching or updating checkouts, preventing old clones from being confused with replacement repositories that reuse their names.

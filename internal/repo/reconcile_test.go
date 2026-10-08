@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
@@ -48,18 +49,17 @@ func transferredFixture(t *testing.T, saved bool, sameName bool) renameFixture {
 	return f
 }
 
-func TestTransfersStopWithoutChangingCheckout(t *testing.T) {
+func TestCloneOnlyRetainsTransferredCheckouts(t *testing.T) {
 	for _, saved := range []bool{false, true} {
 		f := transferredFixture(t, saved, true)
 		before := gitText(t, f.source, "show-ref")
 		configBefore, _ := os.ReadFile(filepath.Join(f.source, ".git", "config"))
 		var syncErr error
-		output := captureStdout(t, func() { syncErr = f.m.Sync(nil, SyncOptions{Workers: 1}) })
+		output := captureStdout(t, func() { syncErr = f.m.Sync(nil, SyncOptions{Mode: SyncCloneOnly, Workers: 1}) })
 		configAfter, _ := os.ReadFile(filepath.Join(f.source, ".git", "config"))
-		if syncErr == nil || !strings.Contains(output, "transferred to t1-archive/perception") || gitText(t, f.source, "show-ref") != before || string(configAfter) != string(configBefore) {
+		if syncErr == nil || !strings.Contains(syncErr.Error(), "transferred to t1-archive/perception") || gitText(t, f.source, "show-ref") != before || string(configAfter) != string(configBefore) {
 			t.Fatalf("transfer was changed or not reported: %v; %s", syncErr, output)
 		}
-		assertProgressCounts(t, output, 1)
 	}
 }
 
@@ -67,7 +67,7 @@ func TestTransferredArchiveCleanupAndReplacement(t *testing.T) {
 	for _, sameName := range []bool{false, true} {
 		f := transferredFixture(t, false, sameName)
 		output := captureStdout(t, func() {
-			if err := f.m.Sync(nil, SyncOptions{Workers: 1, RemoveArchived: true}); err != nil {
+			if err := f.m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -85,7 +85,7 @@ func TestTransferredArchiveBehindRemoteCanBeSafelyCleaned(t *testing.T) {
 	commitFile(t, seed, "later.txt", "later archive work", "later commit")
 	runGit(t, seed, "push", "origin", "main")
 	output := captureStdout(t, func() {
-		if err := f.m.Sync(nil, SyncOptions{Workers: 1, RemoveArchived: true}); err != nil {
+		if err := f.m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -100,7 +100,7 @@ func TestTransferredArchiveWithoutReplacementIsRemovedOnce(t *testing.T) {
 	f := transferredFixture(t, true, true)
 	delete(f.client.repos["t1"], f.newRepo.Name)
 	output := captureStdout(t, func() {
-		if err := f.m.Sync(nil, SyncOptions{Workers: 1, RemoveArchived: true}); err != nil {
+		if err := f.m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -128,9 +128,9 @@ func TestTransferredCleanupRetainsLocalWorkAndFailedClones(t *testing.T) {
 			refs := gitText(t, f.source, "show-ref")
 			configBefore, _ := os.ReadFile(filepath.Join(f.source, ".git", "config"))
 			var syncErr error
-			output := captureStdout(t, func() { syncErr = f.m.Sync(nil, SyncOptions{Workers: 1, RemoveArchived: true}) })
+			output := captureStdout(t, func() { syncErr = f.m.Sync(nil, SyncOptions{Workers: 1}) })
 			configAfter, _ := os.ReadFile(filepath.Join(f.source, ".git", "config"))
-			if syncErr == nil || !isGitRepo(f.source) || gitText(t, f.source, "show-ref") != refs || string(configBefore) != string(configAfter) {
+			if (syncErr != nil) != (kind == "clone failure") || !isGitRepo(f.source) || gitText(t, f.source, "show-ref") != refs || string(configBefore) != string(configAfter) {
 				t.Fatalf("unsafe transfer cleanup changed checkout: %v; %s", syncErr, output)
 			}
 			assertProgressCounts(t, output, 1)
@@ -179,15 +179,6 @@ func renamedFixture(t *testing.T, saved bool) renameFixture {
 	client := fakeClient{repos: map[string]map[string]remote.Repository{"t1": {archive.Name: archive, replacement.Name: replacement}}}
 	manager.providers["fake"] = client
 	return renameFixture{manager, target, client, archive, replacement, source, filepath.Join(root, archive.Name)}
-}
-
-func gitText(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	out, err := gitOutput(dir, args...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
 
 func TestReconcileArchivedRenamePreservesLocalWork(t *testing.T) {
@@ -266,7 +257,7 @@ func TestIdentityChecksDoNotFetchIntoMismatchedCheckout(t *testing.T) {
 	f := renamedFixture(t, true)
 	refs := gitText(t, f.source, "show-ref")
 	identity, _ := os.ReadFile(identityPath(f.source))
-	for _, command := range []string{"status", "list", "pull", "push"} {
+	for _, command := range []string{"status", "list", "push"} {
 		output := captureStdout(t, func() {
 			var err error
 			switch command {
@@ -274,8 +265,6 @@ func TestIdentityChecksDoNotFetchIntoMismatchedCheckout(t *testing.T) {
 				err = f.m.Status(nil, StatusOptions{Workers: 1})
 			case "list":
 				err = f.m.List(nil, false, 1)
-			case "pull":
-				err = f.m.Pull(nil, 1)
 			case "push":
 				err = f.m.Push(nil, 1)
 			}
@@ -683,7 +672,7 @@ func TestPureRenameAndProviderAliasChange(t *testing.T) {
 	r.Archived = false
 	f.client.repos["t1"][r.Name] = r
 	delete(f.client.repos["t1"], f.newRepo.Name)
-	// Metadata alone can describe other new repositories; sync must not clone them.
+	// Sync provisions missing repositories after preserving the renamed checkout.
 	unrelated := f.newRepo
 	unrelated.Name, unrelated.FullName = "unrelated", "t1/unrelated"
 	f.client.repos["t1"][unrelated.Name] = unrelated
@@ -695,8 +684,8 @@ func TestPureRenameAndProviderAliasChange(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if !isGitRepo(f.archive) || isGitRepo(f.source) || isGitRepo(filepath.Join(f.target.Path, "unrelated")) {
-		t.Fatal("pure rename cloned an unrelated repository or lost original")
+	if !isGitRepo(f.archive) || isGitRepo(f.source) || !isGitRepo(filepath.Join(f.target.Path, "unrelated")) {
+		t.Fatal("pure rename did not preserve the original and clone the missing repository")
 	}
 }
 
@@ -1002,4 +991,218 @@ func TestRecoveryRemovesOnlyOwnedGitConfigLocks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultSyncHandlesPrunableTransferredWorktree(t *testing.T) {
+	for _, mode := range []SyncMode{SyncBoth, SyncPull} {
+		for _, unpublished := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%d/unpublished=%v", mode, unpublished), func(t *testing.T) {
+				f := transferredFixture(t, true, false)
+				worktree := filepath.Join(t.TempDir(), "stale worktree\nwith newline")
+				runGit(t, f.source, "worktree", "add", "-b", "old-feature", worktree)
+				if unpublished {
+					configureGitIdentity(t, worktree)
+					commitFile(t, worktree, "local.txt", "saved work", "unpublished work")
+				}
+				if err := os.RemoveAll(worktree); err != nil {
+					t.Fatal(err)
+				}
+				before := gitText(t, f.source, "show-ref")
+				var runErr error
+				output := captureStdout(t, func() { runErr = f.m.Sync(nil, SyncOptions{Mode: mode, Workers: 1}) })
+				if unpublished {
+					if runErr != nil || !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "branch old-feature (1)") || gitText(t, f.source, "show-ref") != before {
+						t.Fatalf("unpublished branch lost: %v; %s", runErr, output)
+					}
+				} else {
+					id, err := readIdentity(f.source)
+					if runErr != nil || err != nil || id == nil || id.RepositoryID != f.newRepo.ID {
+						t.Fatalf("safe transfer not replaced: %v; %+v; %s", runErr, id, output)
+					}
+				}
+				assertProgressCounts(t, output, 1)
+			})
+		}
+	}
+}
+
+func TestTransferredCleanupRetainsLiveLockedAndDetachedWorktrees(t *testing.T) {
+	for _, kind := range []string{"live", "locked missing", "detached missing"} {
+		t.Run(kind, func(t *testing.T) {
+			f := transferredFixture(t, true, false)
+			worktree := filepath.Join(t.TempDir(), "linked")
+			if kind == "detached missing" {
+				runGit(t, f.source, "worktree", "add", "--detach", worktree)
+			} else {
+				runGit(t, f.source, "worktree", "add", "-b", "feature", worktree)
+			}
+			if kind == "locked missing" {
+				runGit(t, f.source, "worktree", "lock", worktree)
+			}
+			if kind != "live" {
+				if err := os.RemoveAll(worktree); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := gitText(t, f.source, "show-ref")
+			var runErr error
+			output := captureStdout(t, func() { runErr = f.m.Sync(nil, SyncOptions{Workers: 1}) })
+			if runErr != nil || !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "has linked worktrees") || gitText(t, f.source, "show-ref") != before {
+				t.Fatalf("protected worktree not retained: %v; %s", runErr, output)
+			}
+		})
+	}
+}
+
+func TestBlockedTransferDoesNotBlockUnrelatedMissingClone(t *testing.T) {
+	f := transferredFixture(t, true, false)
+	writeFile(t, filepath.Join(f.source, "dirty.txt"), "local work")
+	unrelated := createTestRepo(t, t.TempDir(), "t1", "unrelated", "main", filepath.Join(t.TempDir(), "seed"))
+	f.client.repos["t1"][unrelated.name] = remoteRepo(unrelated)
+	var runErr error
+	output := captureStdout(t, func() { runErr = f.m.Sync(nil, SyncOptions{Workers: 2}) })
+	if runErr != nil || !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "dirty worktree") || !isGitRepo(filepath.Join(f.target.Path, "unrelated")) {
+		t.Fatalf("unrelated provisioning blocked: %v; %s", runErr, output)
+	}
+	assertProgressCounts(t, output, 2)
+}
+
+func TestPullOnlyReconcilesReplacementWithoutMixingHistories(t *testing.T) {
+	f := renamedFixture(t, true)
+	oldHead := gitText(t, f.source, "rev-parse", "HEAD")
+	output := captureStdout(t, func() {
+		if err := f.m.Sync(nil, SyncOptions{Mode: SyncPull, Workers: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if gitText(t, f.archive, "rev-parse", "HEAD") != oldHead || !isGitRepo(f.source) {
+		t.Fatal("replacement reconciliation lost original")
+	}
+	assertProgressCounts(t, output, 2)
+}
+
+func TestDefaultSyncRetiresTransfersButRetainsInOrgArchives(t *testing.T) {
+	f := transferredFixture(t, true, false)
+	r := createTestRepo(t, t.TempDir(), "t1", "in-org-archive", "main", filepath.Join(f.target.Path, "in-org-archive"))
+	r.archived = true
+	f.client.repos["t1"][r.name] = remoteRepo(r)
+	output := captureStdout(t, func() {
+		if err := f.m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	id, err := readIdentity(f.source)
+	if err != nil || id == nil || id.RepositoryID != f.newRepo.ID || !isGitRepo(r.workPath) {
+		t.Fatalf("wrong default retirement policy: %s", output)
+	}
+	assertProgressCounts(t, output, 2)
+	output = captureStdout(t, func() {
+		if err := f.m.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := os.Lstat(r.workPath); !os.IsNotExist(err) {
+		t.Fatalf("in-org archive not cleaned with flag: %s", output)
+	}
+	assertProgressCounts(t, output, 2)
+}
+
+func TestTransferredCleanupIgnoresStaleRemoteTrackingRefs(t *testing.T) {
+	for _, localBranch := range []bool{false, true} {
+		t.Run(fmt.Sprint(localBranch), func(t *testing.T) {
+			f := transferredFixture(t, true, false)
+			runGit(t, f.source, "fetch", "origin") // origin now points at the replacement's unrelated history.
+			if localBranch {
+				runGit(t, f.source, "branch", "unpublished", "origin/main")
+			}
+			var runErr error
+			output := captureStdout(t, func() { runErr = f.m.Sync(nil, SyncOptions{Workers: 1}) })
+			if localBranch {
+				if runErr != nil || !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "unpublished commits") {
+					t.Fatalf("local branch not protected: %v; %s", runErr, output)
+				}
+			} else {
+				id, err := readIdentity(f.source)
+				if runErr != nil || err != nil || id == nil || id.RepositoryID != f.newRepo.ID {
+					t.Fatalf("stale fetch cache blocked cleanup: %v; %s", runErr, output)
+				}
+			}
+		})
+	}
+}
+
+func TestSkippedRenameReservesItsDestination(t *testing.T) {
+	f := renamedFixture(t, true)
+	r := f.old
+	r.Archived = false
+	f.client.repos["t1"][r.Name] = r
+	delete(f.client.repos["t1"], f.newRepo.Name)
+	runGit(t, f.source, "worktree", "add", "-b", "feature", filepath.Join(t.TempDir(), "linked"))
+	refs := gitText(t, f.source, "show-ref")
+	output := captureStdout(t, func() {
+		if err := f.m.Sync(nil, SyncOptions{Workers: 2}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(output, "[SKIP]") || !strings.Contains(output, "has linked worktrees") || isGitRepo(f.archive) || gitText(t, f.source, "show-ref") != refs {
+		t.Fatalf("blocked rename destination was provisioned or original changed: %s", output)
+	}
+	assertProgressCounts(t, output, 1)
+}
+
+type gatedArchivesClient struct {
+	remote.Client
+	archives []remote.Repository
+	entered  chan<- struct{}
+	release  <-chan struct{}
+}
+
+func (c gatedArchivesClient) ListArchivedRepos() ([]remote.Repository, error) {
+	select {
+	case c.entered <- struct{}{}:
+	default:
+	}
+	<-c.release
+	return c.archives, nil
+}
+
+func TestCanonicalCheckoutFinishesBeforeArchiveReconciliation(t *testing.T) {
+	f := transferredFixture(t, true, false)
+	fast := createTestRepo(t, t.TempDir(), "t1", "fast", "main", filepath.Join(f.target.Path, "fast"))
+	f.client.repos["t1"][fast.name] = remoteRepo(fast)
+	if err := writeIdentity(fast.workPath, newIdentity(f.m.config.Providers["fake"], "t1", remoteRepo(fast), fast.remotePath)); err != nil {
+		t.Fatal(err)
+	}
+	release, entered := make(chan struct{}), make(chan struct{}, 1)
+	f.m.providers["fake"] = gatedArchivesClient{Client: f.client, archives: []remote.Repository{f.old}, release: release, entered: entered}
+	output := observeCommand(t, func() error { return f.m.Sync(nil, SyncOptions{Workers: 2}) }, func(out *observedOutput) {
+		defer close(release)
+		out.waitFor(t, "[1/2] [OK]    "+fast.workPath)
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("archive reconciliation was not started")
+		}
+		if strings.Contains(out.String(), "[OK]    "+f.source) || strings.Contains(out.String(), "complete:") {
+			t.Fatalf("stalled identity check reported complete: %s", out.String())
+		}
+	})
+	assertProgressCounts(t, output, 2)
+}
+
+func TestLegacyActiveRenameMovesWhenCanonicalCheckoutIsMissing(t *testing.T) {
+	m, _, _, source, dest := activeRenameFixture(t)
+	if err := os.RemoveAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	head := gitText(t, source, "rev-parse", "HEAD")
+	output := captureStdout(t, func() {
+		if err := m.Sync(nil, SyncOptions{RemoveArchived: true, Workers: 2}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if isGitRepo(source) || !isGitRepo(dest) || gitText(t, dest, "rev-parse", "HEAD") != head || strings.Contains(output, "[REMOVE]") {
+		t.Fatalf("sole active checkout not moved safely: %s", output)
+	}
+	assertProgressCounts(t, output, 1)
 }

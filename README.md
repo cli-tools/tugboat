@@ -22,7 +22,7 @@ sudo mv tugboat /usr/local/bin/
 ```
 
 2) Create a personal access token (PAT) on your provider:
-   - **Gitea:** Settings → Applications → Generate Token with **read:organization** and **read:repository** scopes (add **write:repository** if you use `push`/`sync`).
+   - **Gitea:** Settings → Applications → Generate Token with **read:organization** and **read:repository** scopes (add **write:repository** if you use `sync` or `sync --push`).
    - **GitHub:** Settings → Developer settings → Personal access tokens → Generate with **repo** scope (grants read/write access to repositories, including private ones).
 
    **Verify your token works:**
@@ -62,36 +62,47 @@ sudo mv tugboat /usr/local/bin/
 }
 ```
 
-5) Clone
+5) Sync (also clones missing repos)
 ```bash
-tugboat clone rideshare infra mobile-app   # orgs + repo with foldouts
+tugboat sync rideshare infra mobile-app   # orgs + repo with foldouts
 ```
 
 6) Daily
 ```bash
 tugboat status           # shows empty/dirty/ahead/behind + archived/orphan flags
 tugboat status --all     # also list every clean repository
-tugboat pull             # update default branches only; skips dirty/local-only feature branches
-tugboat push             # push ahead repos
+tugboat sync --pull      # update default branches only; skips dirty/local-only feature branches
+tugboat sync --push      # push ahead repos
 tugboat sync             # sync default branches only; skips dirty/local-only feature branches
 tugboat sync --remove-archived  # safely remove archived local checkouts
 ```
 
 ## Commands
-- `clone [target ...]`   — org targets clone repos except configured exclusions; repo targets honor foldouts
-- `status [target ...]`  — groups archived/attention/missing/empty state by target; `--all` expands clean rows
-- `pull [target ...]`    — updates default branches only; clean fully-pushed feature branches auto-switch back first
-- `push [target ...]`
-- `sync [target ...]`    — reconciles org repository renames, then syncs default branches; `--remove-archived` removes verified-safe archived checkouts
-- `list [target ...]`    — shows local + remote; flags archived/orphan
-- `help`, `version`
+- `sync [target ...]` — clone missing repos, reconcile org renames, then pull and push default branches
+- `sync --pull [target ...]` — clone missing repos, reconcile org renames, and pull without pushing local commits
+- `sync --push [target ...]` — push existing checkouts without cloning, pulling, or switching branches
+- `sync --clone-only [target ...]` — clone and reconcile without updating branches; accepts `-E/--exclude-empty` and `-a/--include-archived`
+- `sync --remove-archived [target ...]` — additionally remove safe in-org archives and obsolete renamed duplicates; also works with `--pull`
+- `status [target ...]` — show archived/attention/missing/empty state; `--all` expands clean rows
+- `list [target ...]` — show local + remote; `-a/--include-archived` includes archives
+- `migrate`, `help`, `version`
 
-`pull`, `push`, and `sync` print one numbered final result per repository by
-default, including when no update is needed. Branch switches, rename preservation,
-and replacement cloning are included in that result. Provider metadata requests
-also report progress. Output uses plain lines on stdout, including redirected logs.
-Add `--verbose` for intermediate identity downloads, check completions, Git
-operations, and update-start messages. For example: `tugboat pull t1 --verbose`.
+`--pull`, `--push`, and `--clone-only` are mutually exclusive. The former
+standalone `clone`, `pull`, and `push` commands have been removed. These command
+changes are in the source build; the published v0.9.0 binary uses the old commands.
+
+Sync checks and updates repositories incrementally, printing one numbered final
+result as each repository finishes, including when no update is needed. Results
+appear in completion order as `[done/total]`. Tugboat counts known local checkouts
+and missing active repositories up front, without waiting for Git history checks.
+The total adjusts if a rename changes the planned paths or a newly cloned or
+updated parent declares additional foldouts. Ordinary verified
+checkouts proceed before slower rename and archive reconciliation. Cloning, branch switches, rename preservation, and replacement
+cloning are included in that result. Default output contains the initial `Sync:`
+line, one final result per repository, and the summary. Output uses plain lines
+on stdout, including redirected logs. Add `--verbose` for provider metadata and
+reconciliation diagnostics, identity downloads, check completions, Git operations,
+and update-start messages: `tugboat sync --pull t1 --verbose`.
 
 
 ## Clone exclusions
@@ -127,7 +138,7 @@ No `.tugboatignore` file is read.
 
 ## Renamed and replaced repositories
 
-For organization targets, `sync` and `clone` automatically reconcile repository
+For organization targets, receiving `sync` modes automatically reconcile repository
 renames. If the old `perception` is renamed and archived as `perception-yolo`, and
 a different repository takes the name `perception`, Tugboat:
 
@@ -141,10 +152,19 @@ switch or rebase its branches. Archived checkouts remain skipped during normal
 updates. `sync --remove-archived` can subsequently remove the preserved checkout
 only when all existing cleanup checks pass.
 
+Legacy checkouts whose old name redirects to an active repository are also
+identified by the provider ID and matching upstream history. For example,
+`mango` can be identified as the renamed `perception`. If `perception` already
+has a verified local checkout, plain sync retains `mango` and reports the rename.
+`sync --remove-archived` can remove this obsolete duplicate even though the
+upstream is active. It keeps the canonical checkout and requires all local
+branches, tags, and HEAD commits to be published upstream, a clean worktree,
+no stashes, and all existing path, worktree, and operation safety checks. It
+retains unresolved identities and old names reused by a replacement repository.
+
 Tugboat saves provider instance and repository ID in `.git/tugboat.json`. It
 checks identity before fetching into local refs. `status` and `list` report
-pending changes without moving folders or saving identity metadata. `pull` and
-`push` skip pending repairs; run `sync` to resolve organization targets.
+pending changes without moving folders or saving identity metadata. `sync --push` skips pending repairs; receiving sync modes resolve organization targets.
 Explicit repo targets and foldouts report conflicts without relocating their
 configured paths or editing configuration.
 
@@ -181,21 +201,28 @@ or a trailing slash). `origin` is the existing origin normalized to
 origins use their absolute path. The ID must identify the preserved repository,
 not its replacement. Then run `tugboat sync TARGET`. Provider aliases and token
 rotation do not change identity. A transfer out of the target organization leaves
-maintenance: normal `sync` and `clone` stop and report its destination without
-moving or updating that checkout. Resolve it locally, or use
-`sync --remove-archived` to discard an identified transferred archive only after
-every cleanup check passes. Dirty files, local-only commits, or stashes stop that
-cleanup and leave the checkout intact. Replacement clones are prepared before
-cleanup so a clone failure retains the original. Tugboat creates no extra
-directory layout for transferred checkouts. Other provider instances require
-manual handling.
+maintenance: default sync and `sync --pull` discard verified-safe transferred
+archives and prepare any replacement clone before deletion. Dirty files,
+local-only branch or tag commits, stashes, or live/locked linked worktrees retain
+the checkout and report the blocker as `[SKIP]`. These safety skips do not cause
+a failure exit status; failed provider requests, clones, and Git operations are
+`[ERROR]` and return a failure exit status. Missing, unlocked, prunable branch worktree
+registrations do not block cleanup when their commits are still reachable from
+the branch; those branch commits undergo the same unpublished-commit checks.
+Cached remote-tracking refs do not count as unpublished local work. When commits
+block cleanup, the single result line names only the affected branches, tags,
+stash, or detached HEAD, with a commit count for each.
+`sync --clone-only` and `sync --push` retain transferred checkouts. Active transfers
+and other provider instances require manual handling. Tugboat creates no extra
+directory layout for transferred checkouts.
 
 Occupied destinations, symlinked checkout/Git directories, linked worktrees,
 nested checkouts, explicit `core.worktree` paths, active Git operations, and
 conflicting fetch/push URLs prevent automatic moves. Interrupted replacement
-operations record a pending marker so a later `sync` or `clone` can resume.
-Replacement cloning honors organization exclusions; normal `sync` does not clone
-unrelated missing repositories.
+operations record a pending marker so a later receiving sync can resume.
+All organization cloning honors exclusions. Receiving sync also clones missing
+active repositories after reconciliation. A blocked checkout reserves only its
+own reconciliation paths; other missing repositories in the org can still clone.
 
 Automatic directory reconciliation uses Linux locks and atomic no-replace
 renames, matching the supported release platforms. Other platforms report
@@ -220,15 +247,15 @@ pending changes and retain ordinary cloning and update commands.
 
 ## Safety
 - ff-only pulls by default; diverged branches are rebased (rebase is aborted on conflicts).
-- `pull` and `sync` only manage each repo's default branch.
-- Clean feature branches with no unpushed commits are auto-switched back to the default branch before `pull` or `sync` continues.
-- `pull` and `sync` skip dirty repos before pulling, rebasing, switching branches, or syncing.
+- `sync --pull` and default `sync` only manage each repo's default branch.
+- Clean feature branches with no unpushed commits are auto-switched back to the default branch before `sync --pull` or default `sync` continues.
+- `sync --pull` and default `sync` skip dirty repos before pulling, rebasing, switching branches, or syncing.
 - Feature branches with local-only commits are skipped rather than updated.
-- `push` may still push committed-ahead changes; it is not skipped solely because the worktree is dirty.
+- `sync --push` may still push committed-ahead changes; it is not skipped solely because the worktree is dirty.
 - Repos left on a deleted feature branch are only switched when the branch has no commits outside the default branch.
-- Repos with no commits locally or on origin are reported as empty and safely skipped by `pull`, `push`, and `sync`.
+- Repos with no commits locally or on origin are reported as empty and safely skipped by all sync modes.
 - When an empty repo gets its first commit, Tugboat can pull it from origin or push it from the local clone normally.
-- Archived repos are flagged and skipped by `pull`, `push`, and normal `sync`; orphans are flagged as local but missing remote.
+- Archived repos are flagged and skipped by normal sync modes; orphans are flagged as local but missing remote.
 - `sync --remove-archived` permanently removes an archived checkout only after confirming its provider identity, origin URL, clean worktree, upstream default branch, and absence of local-only commits, stashes, linked worktrees, active Git operations, or remaining nested checkouts.
 - Behind archived default branches are fast-forwarded before removal. Diverged repositories and repositories containing local work are retained. Ignored files are considered disposable and are removed with an otherwise-safe checkout.
 - Explicit repo and foldout declarations remain in configuration after cleanup; later status runs report those checkouts as missing rather than treating them as errors.

@@ -557,6 +557,10 @@ func (m *Manager) reconcileCheckout(t config.Target, s RepoStatus, repos map[str
 }
 
 func (m *Manager) reconcileOrg(t config.Target, repos map[string]remote.Repository, probe *historyProbe, excludeEmpty, includeArchived bool, removeTransferred ...bool) map[string]error {
+	return m.reconcileOrgReady(t, repos, probe, excludeEmpty, includeArchived, len(removeTransferred) > 0 && removeTransferred[0], false, nil, nil)
+}
+
+func (m *Manager) reconcileOrgReady(t config.Target, repos map[string]remote.Repository, probe *historyProbe, excludeEmpty, includeArchived, retire, removeDuplicates bool, done func(string) bool, ready func(string, error)) map[string]error {
 	failures := make(map[string]error)
 	entries, err := os.ReadDir(t.Path)
 	if os.IsNotExist(err) {
@@ -568,27 +572,63 @@ func (m *Manager) reconcileOrg(t config.Target, repos map[string]remote.Reposito
 	}
 	for _, entry := range entries {
 		dir := filepath.Join(t.Path, entry.Name())
-		if !entry.IsDir() || !isGitRepo(dir) {
+		if !entry.IsDir() || !isGitRepo(dir) || done != nil && done(dir) {
 			continue
 		}
 		probe.progress.detail("  [DETAIL] %s: verifying repository identity\n", dir)
 		s := m.inspectIdentity(statusJob{path: dir, target: t.Name, provider: t.Provider, org: t.Org, name: entry.Name(), token: m.config.Providers[t.Provider].Token}, repos, probe)
 		if hasStatusError(s) {
 			failures[dir] = errors.New(statusErrorMessage(s))
+			if ready != nil {
+				ready(dir, failures[dir])
+			}
 			continue
 		}
 		if s.Transferred {
-			if len(removeTransferred) == 0 || !removeTransferred[0] {
+			if !retire {
 				failures[dir] = errors.New(s.IdentityIssue)
 			} else if err := m.removeTransferredCheckout(t, s, repos, probe); err != nil {
-				failures[dir] = fmt.Errorf("%s: %w", s.IdentityIssue, err)
+				var skip *archiveSkipError
+				if errors.As(err, &skip) {
+					probe.progress.note(dir, skip.reason)
+				} else {
+					failures[dir] = fmt.Errorf("%s: %w", s.IdentityIssue, err)
+				}
+			}
+			if ready != nil {
+				ready(dir, failures[dir])
+			}
+			continue
+		}
+		if removeDuplicates && s.ReplacementID == 0 && s.repository != nil && s.repository.Name != s.Name && isGitRepo(filepath.Join(t.Path, s.repository.Name)) {
+			err := m.removeRenamedDuplicate(t, s, repos, probe)
+			if err != nil {
+				var skip *archiveSkipError
+				if errors.As(err, &skip) {
+					probe.progress.note(dir, skip.reason)
+				} else {
+					failures[dir] = err
+				}
+			} else {
+				probe.progress.note(dir, "removed duplicate of "+t.Org+"/"+s.repository.Name+"; kept "+filepath.Join(t.Path, s.repository.Name))
+				if probe.progress.removed == nil {
+					probe.progress.removed = make(map[string]bool)
+				}
+				probe.progress.removed[dir] = true
+			}
+			if ready != nil {
+				ready(dir, failures[dir])
 			}
 			continue
 		}
 		changed, err := m.reconcileCheckout(t, s, repos, excludeEmpty, includeArchived)
 		if changed && s.repository != nil {
 			dest := filepath.Join(t.Path, s.repository.Name)
+			probe.progress.plan(dest)
 			if dest != dir {
+				if !isGitRepo(dir) && err == nil {
+					probe.progress.relocate(dir, dest)
+				}
 				probe.progress.note(dest, "preserved from "+dir)
 			} else if s.identity.Pending != nil {
 				probe.progress.note(dest, "replacement recovery completed")
@@ -610,12 +650,26 @@ func (m *Manager) reconcileOrg(t config.Target, repos map[string]remote.Reposito
 			var skip *archiveSkipError
 			if errors.As(err, &skip) {
 				probe.progress.note(dir, skip.reason)
+				if !removeDuplicates && s.ReplacementID == 0 && s.repository != nil && s.repository.Name != s.Name && isGitRepo(filepath.Join(t.Path, s.repository.Name)) {
+					probe.progress.note(dir, "use --remove-archived for safe duplicate cleanup")
+				}
 				probe.progress.detail("  [SKIP] %s: %s\n", dir, skip.reason)
 			} else {
 				failures[dir] = err
 			}
 		} else if s.IdentityIssue != "" && s.identity == nil {
 			probe.progress.detail("  [SKIP] %s: %s\n", dir, s.IdentityIssue)
+		}
+		if ready != nil {
+			if isGitRepo(dir) || failures[dir] != nil {
+				ready(dir, failures[dir])
+			}
+			if changed && s.repository != nil {
+				dest := filepath.Join(t.Path, s.repository.Name)
+				if dest != dir && isGitRepo(dest) {
+					ready(dest, nil)
+				}
+			}
 		}
 	}
 	return failures

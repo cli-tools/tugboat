@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -208,30 +207,34 @@ func (p *historyProbe) close() {
 
 // Compare all local refs in the isolated database, where provider commits are
 // available even when the checkout is behind its transferred archive.
-func (p *historyProbe) localOnly(dir string, remoteObjects []string) (int, error) {
+func (p *historyProbe) localOnly(dir string, remoteObjects []string) (unpublishedWork, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.next++
 	namespace := fmt.Sprintf("refs/tugboat/cleanup/%d", p.next)
 	if _, err := gitOutput(p.dir, "config", "remote.local-checkout.url", dir); err != nil {
-		return 0, err
+		return unpublishedWork{}, err
 	}
 	if _, err := gitOutput(p.dir, "-c", "uploadpack.allowFilter=true", "fetch", "--filter=tree:0", "--quiet", "--no-tags", "--no-write-fetch-head", "local-checkout", "+refs/*:"+namespace+"/*", "+HEAD:"+namespace+"/HEAD"); err != nil {
-		return 0, err
+		return unpublishedWork{}, err
 	}
 	refs, err := gitOutput(p.dir, "for-each-ref", "--format=%(refname)", namespace)
 	if err != nil {
-		return 0, err
+		return unpublishedWork{}, err
 	}
-	args := append([]string{"rev-list", "--count"}, strings.Fields(refs)...)
-	args = append(args, "--not")
-	args = append(args, remoteObjects...)
-	out, err := gitOutput(p.dir, args...)
-	if err != nil {
-		return 0, err
+	var localRefs []localWorkRef
+	for _, ref := range strings.Fields(refs) {
+		name := strings.TrimPrefix(ref, namespace+"/")
+		if strings.HasPrefix(name, "remotes/") {
+			continue
+		}
+		label := localWorkLabel("refs/" + name)
+		if name == "HEAD" {
+			label = checkoutHeadLabel(dir)
+		}
+		localRefs = append(localRefs, localWorkRef{ref: ref, label: label})
 	}
-	count, err := strconv.Atoi(strings.TrimSpace(out))
-	return count, err
+	return inspectUnpublishedWork(p.dir, localRefs, remoteObjects)
 }
 
 func (p *historyProbe) matches(dir, key, token, protocol string, r remote.Repository) (bool, error) {
@@ -394,6 +397,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 				return s
 			}
 		}
+		upstream, hasUpstream := named, hasNamed
 		if !hasNamed {
 			// Old origins must still address this provider and organization. Use
 			// the old name with each canonical provider URL to validate its scope.
@@ -408,26 +412,46 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 				s.IdentityIssue = "origin is outside this target; not maintained"
 				return s
 			}
+			// Resolve an old name before scanning archives. Providers can redirect
+			// this lookup to an active repository under its new name.
+			redirected, lookupErr := m.providers[job.provider].GetRepo(job.org, job.name)
+			if lookupErr != nil {
+				s.Error = "checking repository rename: " + lookupErr.Error()
+				return s
+			}
+			if redirected != nil {
+				current, ok := repos[redirected.Name]
+				if ok && current.ID == redirected.ID && current.ID > 0 && repositoryOwner(*redirected, job.org) == job.org && originMatches(origin, withRepoName(current, job.name)) {
+					upstream, hasUpstream = current, true
+					found := false
+					for _, candidate := range candidates {
+						found = found || candidate.ID == current.ID
+					}
+					if !found {
+						candidates = append(candidates, current)
+					}
+				}
+			}
 		}
 		headExists := gitRun(job.path, "rev-parse", "--verify", "--quiet", "HEAD") == nil
 		shallow, _ := gitOutput(job.path, "rev-parse", "--is-shallow-repository")
-		matchedNamedID := int64(0)
-		if hasNamed && !named.Archived && !named.Empty && headExists && strings.TrimSpace(shallow) != "true" {
-			if named.ID <= 0 {
+		matchedUpstreamID := int64(0)
+		if hasUpstream && !upstream.Archived && !upstream.Empty && headExists && strings.TrimSpace(shallow) != "true" {
+			if upstream.ID <= 0 {
 				s.Error = "provider returned an invalid repository ID"
 				return s
 			}
-			match, err := probe.matches(job.path, orgKey{job.provider, job.org}.string(), job.token, p.Options.Clone.Protocol, named)
+			match, err := probe.matches(job.path, orgKey{job.provider, job.org}.string(), job.token, p.Options.Clone.Protocol, upstream)
 			if err != nil {
 				s.Error = "checking upstream history: " + err.Error()
 				return s
 			}
 			if match {
-				candidates = []remote.Repository{named}
-				matchedNamedID = named.ID
+				candidates = []remote.Repository{upstream}
+				matchedUpstreamID = upstream.ID
 			}
 		}
-		if matchedNamedID == 0 {
+		if matchedUpstreamID == 0 {
 			archives, lookupErr := probe.archivedRepos(job.provider, m.providers[job.provider])
 			if lookupErr != nil {
 				s.Error = "checking archive metadata: " + lookupErr.Error()
@@ -456,7 +480,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 				s.Error = "provider returned an invalid repository ID"
 				return s
 			}
-			match := r.ID == matchedNamedID
+			match := r.ID == matchedUpstreamID
 			if match {
 				// The current upstream was already verified above.
 			} else if !headExists || r.Empty {
@@ -506,7 +530,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 	applyRemoteState(&s, *resolved)
 	if owner := repositoryOwner(*resolved, job.org); !strings.EqualFold(owner, job.org) {
 		s.Transferred = true
-		s.IdentityIssue = fmt.Sprintf("transferred to %s/%s (ID %d); outside this target's maintenance; resolve locally or use sync --remove-archived after preserving local work", owner, resolved.Name, resolved.ID)
+		s.IdentityIssue = fmt.Sprintf("transferred to %s/%s (ID %d); outside this target's maintenance", owner, resolved.Name, resolved.ID)
 		if hasNamed && named.ID != resolved.ID {
 			s.ReplacementID = named.ID
 		}

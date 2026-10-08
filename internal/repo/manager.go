@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
@@ -70,9 +72,21 @@ type StatusOptions struct {
 	Workers int
 }
 
+type SyncMode int
+
+const (
+	SyncBoth SyncMode = iota
+	SyncPull
+	SyncPush
+	SyncCloneOnly
+)
+
 type SyncOptions struct {
-	RemoveArchived bool
-	Workers        int
+	Mode            SyncMode
+	RemoveArchived  bool
+	ExcludeEmpty    bool
+	IncludeArchived bool
+	Workers         int
 }
 
 type foldoutRepo struct {
@@ -141,17 +155,17 @@ func (m *Manager) buildRepoIndex(orgs []orgKey, progress *progressReporter) (map
 	errorsByOrg := make(map[string]error)
 	for _, k := range orgs {
 		key := k.string()
-		progress.printf("Loading repository metadata for %s/%s...\n", k.provider, k.org)
+		progress.detail("Loading repository metadata for %s/%s...\n", k.provider, k.org)
 		client, ok := m.providers[k.provider]
 		if !ok {
 			errorsByOrg[key] = fmt.Errorf("no client for provider %s", k.provider)
-			progress.printf("  Metadata failed for %s/%s: %v\n", k.provider, k.org, errorsByOrg[key])
+			progress.detail("  Metadata failed for %s/%s: %v\n", k.provider, k.org, errorsByOrg[key])
 			continue
 		}
 		repos, err := client.ListOrgRepos(k.org)
 		if err != nil {
 			errorsByOrg[key] = fmt.Errorf("listing repos for %s/%s: %w", k.provider, k.org, err)
-			progress.printf("  Metadata failed for %s/%s: %v\n", k.provider, k.org, errorsByOrg[key])
+			progress.detail("  Metadata failed for %s/%s: %v\n", k.provider, k.org, errorsByOrg[key])
 			continue
 		}
 		reposByName := make(map[string]remote.Repository, len(repos))
@@ -159,7 +173,7 @@ func (m *Manager) buildRepoIndex(orgs []orgKey, progress *progressReporter) (map
 			reposByName[r.Name] = r
 		}
 		index[key] = reposByName
-		progress.printf("  Metadata loaded for %s/%s\n", k.provider, k.org)
+		progress.detail("  Metadata loaded for %s/%s\n", k.provider, k.org)
 	}
 	return index, errorsByOrg
 }
@@ -232,6 +246,10 @@ type updateSkipError struct {
 func (e *updateSkipError) Error() string { return e.reason }
 
 func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool, workers int) error {
+	return m.Sync(targetNames, SyncOptions{Mode: SyncCloneOnly, ExcludeEmpty: excludeEmpty, IncludeArchived: includeArchived, Workers: workers})
+}
+
+func (m *Manager) cloneOnly(targetNames []string, excludeEmpty, includeArchived bool, workers int) error {
 	targets, err := m.targetsFor(targetNames)
 	if err != nil {
 		return err
@@ -843,10 +861,10 @@ func discoverStatusJobs(targets []config.Target, cfg *config.Config) ([]statusJo
 }
 
 func (m *Manager) getAllStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter) ([]RepoStatus, []RepoTiming, error) {
-	return m.scanStatuses(targets, debug, workers, progress, false)
+	return m.scanStatuses(targets, debug, workers, progress)
 }
 
-func (m *Manager) scanStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter, reconcile bool, removeTransferred ...bool) ([]RepoStatus, []RepoTiming, error) {
+func (m *Manager) scanStatuses(targets []config.Target, debug bool, workers int, progress *progressReporter) ([]RepoStatus, []RepoTiming, error) {
 	jobs, orgKeys, err := discoverStatusJobs(targets, m.config)
 	if err != nil {
 		return nil, nil, err
@@ -854,106 +872,17 @@ func (m *Manager) scanStatuses(targets []config.Target, debug bool, workers int,
 	index, metadataErrors := m.buildRepoIndex(orgKeys, progress)
 	probe := &historyProbe{progress: progress}
 	defer probe.close()
-	failures := make(map[string]error)
-	if reconcile {
-		originalJobs := jobs
-		for _, t := range targets {
-			key := orgKey{t.Provider, t.Org}.string()
-			if t.Repo != "" || metadataErrors[key] != nil {
-				continue
-			}
-			progress.printf("Reconciling repository identities for %s/%s...\n", t.Provider, t.Org)
-			for path, err := range m.reconcileOrg(t, index[key], probe, false, false, removeTransferred...) {
-				failures[path] = err
-			}
-		}
-		jobs, _, err = discoverStatusJobs(targets, m.config)
-		if err != nil {
-			return nil, nil, err
-		}
-		seen := make(map[string]bool)
-		for _, job := range jobs {
-			seen[job.path] = true
-		}
-		for _, job := range originalJobs {
-			if (failures[job.path] != nil || progress.removed[job.path]) && !seen[job.path] {
-				job.missing = !isGitRepo(job.path)
-				jobs = append(jobs, job)
-				seen[job.path] = true
-			}
-		}
-	}
-	if len(jobs) == 0 {
-		return nil, nil, nil
-	}
-
 	progress.beginChecks(len(jobs))
+	metadata := &scanMetadata{index: index, errors: metadataErrors}
 	results := pool.Run(jobs, workers, func(job statusJob) statusResult {
-		defer progress.checkFinished(job.path)
-		var timing RepoTiming
-		if job.missing {
-			s := m.inspectIdentity(job, index[orgKey{job.provider, job.org}.string()], probe)
-			if err := metadataErrors[orgKey{job.provider, job.org}.string()]; err != nil {
-				s.MetadataError = err.Error()
-			}
-			if err := failures[job.path]; err != nil {
-				s.Error, s.ReconcileError = err.Error(), true
-			}
-			if progress != nil {
-				s.Removed = progress.removed[job.path]
-			}
-			return statusResult{status: s}
-		}
-		key := orgKey{job.provider, job.org}.string()
-		identity := RepoStatus{Path: job.path, Target: job.target, Provider: job.provider, Org: job.org, Name: job.name}
-		if metadataErr := metadataErrors[key]; metadataErr != nil {
-			identity.MetadataError = metadataErr.Error()
-		} else {
-			identity = m.inspectIdentity(job, index[key], probe)
-		}
-		if failure := failures[job.path]; failure != nil {
-			identity.Error, identity.ReconcileError = failure.Error(), true
-		}
-		fetch := !hasStatusError(identity) && identity.IdentityIssue == "" && !identity.Orphan
-		if fetch {
-			var err error
-			if progress == nil {
-				err = m.confirmStatusIdentity(identity)
-			} else {
-				err = m.saveVerifiedIdentity(identity)
-			}
-			if err != nil {
-				identity.Error = err.Error()
-				fetch = false
-			}
-		}
-		status := getRepoStatusWithProgressAndFetch(job.path, job.target, job.org, job.name, job.provider, job.token, &timing, progress, fetch)
-		if fetch && status.RemoteError == "" {
-			if err := m.confirmStatusIdentity(identity); err != nil {
-				identity.Error = err.Error()
-			}
-		}
-		status.IdentityIssue, status.RepositoryID, status.RemoteName = identity.IdentityIssue, identity.RepositoryID, identity.RemoteName
-		status.ReplacementID, status.identity, status.repository = identity.ReplacementID, identity.identity, identity.repository
-		status.gitDirInfo = identity.gitDirInfo
-		status.ReconcileError, status.Orphan, status.MetadataError = identity.ReconcileError, identity.Orphan, identity.MetadataError
-		status.Transferred = identity.Transferred
-		if identity.Error != "" {
-			status.Error = identity.Error
-		}
-		if identity.repository != nil {
-			applyRemoteState(&status, *identity.repository)
-		}
-		return statusResult{status: status, timing: timing}
+		return m.scanStatus(job, metadata, probe, progress, nil)
 	})
-
 	statuses := make([]RepoStatus, len(results))
 	timings := make([]RepoTiming, len(results))
 	for i, r := range results {
 		statuses[i] = r.status
 		timings[i] = r.timing
 	}
-
 	sort.Slice(statuses, func(i, j int) bool {
 		if statuses[i].Target == statuses[j].Target {
 			return statuses[i].Name < statuses[j].Name
@@ -1199,46 +1128,6 @@ func gitPullRebase(repoPath string, token string) error {
 		os.Stderr.Write(out)
 	}
 	return err
-}
-
-// gitPullWithFallback tries a normal pull (ff-only when requested) and, if
-// that fails because the branch has diverged, falls back to a rebase pull.
-// Returns (true, nil) when the fallback rebase succeeded.  If the rebase
-// itself fails (e.g. conflicts) it is aborted so the repo stays clean.
-func gitPullWithFallback(repoPath string, ffOnly bool, token string) (rebased bool, err error) {
-	args := []string{"pull"}
-	if ffOnly {
-		args = append(args, "--ff-only")
-	}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repoPath
-	cmd.Env = gitEnvWithAuth(token)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return false, nil
-	}
-	// Only fall back to rebase when ff-only was requested and the failure is
-	// specifically because branches have diverged.  Other failures (auth,
-	// network, missing remote, etc.) must not trigger a rebase attempt.
-	if !ffOnly || !strings.Contains(string(out), "Not possible to fast-forward") {
-		os.Stderr.Write(out)
-		return false, err
-	}
-	// Fallback: rebase with merge preservation.
-	cmd2 := exec.Command("git", "pull", "--rebase=merges")
-	cmd2.Dir = repoPath
-	cmd2.Env = gitEnvWithAuth(token)
-	out2, err2 := cmd2.CombinedOutput()
-	if err2 != nil {
-		// Abort the rebase so the repo is not left in a broken mid-rebase state.
-		abort := exec.Command("git", "rebase", "--abort")
-		abort.Dir = repoPath
-		abort.Env = gitEnvNoPrompt()
-		abort.Run() // best-effort
-		os.Stderr.Write(out2)
-		return false, err2
-	}
-	return true, nil
 }
 
 func gitPush(repoPath, token string) error {
@@ -1622,28 +1511,21 @@ func refreshArchiveRemote(repoPath, token string) ([]string, error) {
 	return objectIDs, nil
 }
 
-func localOnlyCommitCount(repoPath string, remoteObjectIDs []string) (int, error) {
-	args := []string{"rev-list", "--all", "--stdin"}
-	if gitRun(repoPath, "rev-parse", "--verify", "--quiet", "HEAD") == nil {
-		args = append(args, "HEAD")
-	}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repoPath
-	cmd.Env = gitEnvNoPrompt()
-	var exclusions strings.Builder
-	for _, objectID := range remoteObjectIDs {
-		fmt.Fprintf(&exclusions, "^%s\n", objectID)
-	}
-	cmd.Stdin = strings.NewReader(exclusions.String())
-	output, err := cmd.CombinedOutput()
+func localUnpublishedWork(repoPath string, remoteObjectIDs []string) (unpublishedWork, error) {
+	refs, err := gitOutput(repoPath, "for-each-ref", "--format=%(refname)")
 	if err != nil {
-		return 0, fmt.Errorf("checking local-only commits: %w: %s", err, strings.TrimSpace(string(output)))
+		return unpublishedWork{}, fmt.Errorf("listing local refs: %w", err)
 	}
-	trimmed := strings.TrimSpace(string(output))
-	if trimmed == "" {
-		return 0, nil
+	var localRefs []localWorkRef
+	for _, ref := range strings.Fields(refs) {
+		if !strings.HasPrefix(ref, "refs/remotes/") {
+			localRefs = append(localRefs, localWorkRef{ref: ref, label: localWorkLabel(ref)})
+		}
 	}
-	return len(strings.Split(trimmed, "\n")), nil
+	if gitRun(repoPath, "rev-parse", "--verify", "--quiet", "HEAD") == nil {
+		localRefs = append(localRefs, localWorkRef{ref: "HEAD", label: checkoutHeadLabel(repoPath)})
+	}
+	return inspectUnpublishedWork(repoPath, localRefs, remoteObjectIDs)
 }
 
 func activeGitOperation(repoPath string) (string, error) {
@@ -1666,18 +1548,47 @@ func activeGitOperation(repoPath string) (string, error) {
 	return "", nil
 }
 
+// Missing, unlocked branch worktrees marked prunable by Git contain no
+// worktree files. Their commits remain protected through the branch ref. Keep
+// live, locked, detached, or unresolvable registrations as cleanup blockers.
 func hasLinkedWorktree(repoPath string) (bool, error) {
-	output, err := gitOutput(repoPath, "worktree", "list", "--porcelain")
+	output, err := gitOutput(repoPath, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return false, fmt.Errorf("listing linked worktrees: %w", err)
 	}
-	count := 0
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, "worktree ") {
-			count++
+	for i, record := range strings.Split(strings.TrimSuffix(output, "\x00\x00"), "\x00\x00") {
+		if i == 0 {
+			continue
+		}
+		var dir, head, branch string
+		var prunable, locked bool
+		for _, field := range strings.Split(record, "\x00") {
+			switch {
+			case strings.HasPrefix(field, "worktree "):
+				dir = strings.TrimPrefix(field, "worktree ")
+			case strings.HasPrefix(field, "HEAD "):
+				head = strings.TrimPrefix(field, "HEAD ")
+			case strings.HasPrefix(field, "branch "):
+				branch = strings.TrimPrefix(field, "branch ")
+			case field == "prunable" || strings.HasPrefix(field, "prunable "):
+				prunable = true
+			case field == "locked" || strings.HasPrefix(field, "locked "):
+				locked = true
+			}
+		}
+		if dir == "" || !prunable || locked || head == "" || branch == "" {
+			return true, nil
+		}
+		if _, err := os.Lstat(dir); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("checking linked worktree %s: %w", dir, err)
+		}
+		if gitRun(repoPath, "merge-base", "--is-ancestor", head, branch) != nil {
+			return true, nil
 		}
 	}
-	return count > 1, nil
+	return false, nil
 }
 
 func nestedGitCheckout(repoPath string) (string, error) {
@@ -1727,12 +1638,12 @@ func verifyArchivedLocalState(repoPath string, remoteObjectIDs []string) error {
 	} else if nested != "" {
 		return archiveSkip("contains nested Git checkout " + nested)
 	}
-	localOnly, err := localOnlyCommitCount(repoPath, remoteObjectIDs)
+	localOnly, err := localUnpublishedWork(repoPath, remoteObjectIDs)
 	if err != nil {
 		return err
 	}
-	if localOnly > 0 {
-		return archiveSkip(fmt.Sprintf("contains %d local-only commits", localOnly))
+	if localOnly.count > 0 {
+		return archiveSkip(localOnly.reason())
 	}
 	return nil
 }
@@ -1846,190 +1757,13 @@ func (m *Manager) removeArchivedRepo(s RepoStatus, target config.Target, token s
 	return fastForwarded, nil
 }
 
-// TODO: implement sync/pull/push/list using the new target model.
+// Pull and Push are internal convenience entry points for the shared sync engine.
 func (m *Manager) Pull(targetNames []string, workers int) error {
-	targets, err := m.targetsFor(targetNames)
-	if err != nil {
-		return err
-	}
-	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
-	progress.printf("Pull: discovering repositories...\n")
-
-	var existingTargets []config.Target
-	for _, t := range targets {
-		if _, err := os.Stat(t.Path); err == nil {
-			existingTargets = append(existingTargets, t)
-		}
-	}
-
-	statuses, _, err := m.getAllStatuses(existingTargets, false, workers, progress)
-	if err != nil {
-		return err
-	}
-	if len(statuses) == 0 {
-		fmt.Println("Pull: no repositories found.")
-		return nil
-	}
-
-	optMap := make(map[string]config.ProviderOptions)
-	tokenMap := make(map[string]string)
-	for _, t := range targets {
-		optMap[t.Name] = m.config.Providers[t.Provider].Options
-		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
-	}
-
-	var pulled, skipped, failed int
-	for _, s := range statuses {
-		progress.detail("  [START] %s: pull\n", s.Path)
-		opts := optMap[s.Target]
-		tok := tokenMap[s.Target]
-
-		if hasStatusError(s) {
-			progress.finish("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
-			failed++
-			continue
-		}
-		if s.IdentityIssue != "" || s.Orphan {
-			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
-			skipped++
-			continue
-		}
-		if s.Archived {
-			progress.finish("  [SKIP]  %s: archived\n", s.Path)
-			skipped++
-			continue
-		}
-		if s.RemoteEmpty {
-			reason := "origin has no commits"
-			if s.Unborn {
-				reason = "no commits locally or on origin"
-			}
-			progress.finish("  [SKIP]  %s: %s\n", s.Path, reason)
-			skipped++
-			continue
-		}
-
-		if err := m.confirmStatusIdentity(s); err != nil {
-			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-			continue
-		}
-		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
-		if err != nil {
-			var skipErr *updateSkipError
-			if errors.As(err, &skipErr) {
-				progress.finish("  [SKIP]  %s: %s\n", s.Path, skipErr.reason)
-				skipped++
-				continue
-			}
-			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-			continue
-		}
-		if switched {
-			progress.note(s.Path, "switched "+s.Branch+" -> "+prepared.DefaultBranch)
-			progress.detail("  [SWITCH] %s: %s -> %s\n", s.Path, s.Branch, prepared.DefaultBranch)
-		}
-		if hasStatusError(prepared) {
-			progress.finish("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
-			failed++
-			continue
-		}
-		if prepared.Dirty {
-			progress.finish("  [SKIP]  %s: dirty\n", prepared.Path)
-			skipped++
-			continue
-		}
-
-		rebased, err := gitPullWithFallback(prepared.Path, opts.Sync.GetFFOnly(), tok)
-		if err != nil {
-			progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
-			failed++
-			continue
-		}
-		if rebased {
-			progress.finish("  [REBASE] %s\n", prepared.Path)
-		} else {
-			progress.finish("  [PULL]  %s\n", prepared.Path)
-		}
-		pulled++
-	}
-
-	fmt.Printf("Pull complete: %d pulled, %d skipped, %d failed\n", pulled, skipped, failed)
-	return nil
+	return m.Sync(targetNames, SyncOptions{Mode: SyncPull, Workers: workers})
 }
 
 func (m *Manager) Push(targetNames []string, workers int) error {
-	targets, err := m.targetsFor(targetNames)
-	if err != nil {
-		return err
-	}
-	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
-	progress.printf("Push: discovering repositories...\n")
-
-	statuses, _, err := m.getAllStatuses(targets, false, workers, progress)
-	if err != nil {
-		return err
-	}
-
-	// Build target -> token map for push authentication.
-	tokenMap := make(map[string]string)
-	for _, t := range targets {
-		tokenMap[t.Name] = m.config.Providers[t.Provider].Token
-	}
-
-	var pushed, skipped, failed int
-	for _, s := range statuses {
-		progress.detail("  [START] %s: push\n", s.Path)
-		if hasStatusError(s) {
-			progress.finish("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
-			failed++
-			continue
-		}
-		if s.Missing {
-			progress.finish("  [SKIP]  %s: missing\n", s.Path)
-			skipped++
-			continue
-		}
-		if s.IdentityIssue != "" || s.Orphan {
-			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
-			skipped++
-			continue
-		}
-		if s.Archived {
-			progress.finish("  [SKIP]  %s: archived\n", s.Path)
-			skipped++
-			continue
-		}
-		if isEmptyRepository(s) {
-			progress.finish("  [SKIP]  %s: no commits locally or on origin\n", s.Path)
-			skipped++
-			continue
-		}
-		if s.Behind > 0 {
-			progress.finish("  [SKIP]  %s: behind remote, pull first\n", s.Path)
-			skipped++
-			continue
-		}
-		if s.Ahead == 0 {
-			progress.finish("  [OK]    %s: nothing to push\n", s.Path)
-			continue
-		}
-		if err := m.confirmStatusIdentity(s); err != nil {
-			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-			continue
-		}
-		if err := gitPush(s.Path, tokenMap[s.Target]); err != nil {
-			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-		} else {
-			progress.finish("  [PUSH]  %s: %d commits\n", s.Path, s.Ahead)
-			pushed++
-		}
-	}
-	fmt.Printf("Push complete: %d pushed, %d skipped, %d failed\n", pushed, skipped, failed)
-	return nil
+	return m.Sync(targetNames, SyncOptions{Mode: SyncPush, Workers: workers})
 }
 
 func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
@@ -2037,11 +1771,53 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	if err != nil {
 		return err
 	}
+	if runOpts.Mode < SyncBoth || runOpts.Mode > SyncCloneOnly {
+		return fmt.Errorf("invalid sync mode")
+	}
+	if runOpts.Mode == SyncCloneOnly {
+		if runOpts.RemoveArchived {
+			return fmt.Errorf("--remove-archived cannot be combined with --clone-only")
+		}
+		return m.cloneOnly(targetNames, runOpts.ExcludeEmpty, runOpts.IncludeArchived, runOpts.Workers)
+	}
+	if runOpts.ExcludeEmpty || runOpts.IncludeArchived {
+		return fmt.Errorf("--exclude-empty and --include-archived require --clone-only")
+	}
+	if runOpts.Mode == SyncPush && runOpts.RemoveArchived {
+		return fmt.Errorf("--remove-archived cannot be combined with --push")
+	}
+	for _, t := range targets {
+		if err := t.ValidateExclusions(); err != nil {
+			return err
+		}
+	}
 	progress := &progressReporter{out: os.Stdout, verbose: m.Verbose}
-	progress.printf("Sync: discovering repositories...\n")
-	statuses, _, err := m.scanStatuses(targets, false, runOpts.Workers, progress, true, runOpts.RemoveArchived)
-	if err != nil {
-		return err
+	action, label, word := "sync", "Sync", "synced"
+	if runOpts.Mode == SyncPull {
+		action, label, word = "pull", "Pull", "pulled"
+	}
+	if runOpts.Mode == SyncPush {
+		action, label, word = "push", "Push", "pushed"
+	}
+	progress.printf("%s: discovering repositories...\n", label)
+	if runOpts.Mode != SyncPush {
+		for _, t := range targets {
+			if t.Repo == "" {
+				if err := os.MkdirAll(t.Path, 0755); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		var existing []config.Target
+		for _, t := range targets {
+			if t.Repo != "" {
+				existing = append(existing, t)
+			} else if _, err := os.Stat(t.Path); !os.IsNotExist(err) {
+				existing = append(existing, t)
+			}
+		}
+		targets = existing
 	}
 
 	// Map target names to provider settings and target boundaries.
@@ -2055,68 +1831,99 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	}
 
 	var archivedStatuses []RepoStatus
-	var synced, removed, skipped, failed int
-	reconcileFailed := false
-	for _, s := range statuses {
-		reconcileFailed = reconcileFailed || s.ReconcileError
-	}
-	for _, s := range statuses {
+	var synced, removed, skipped, failed atomic.Int64
+	var resultMu sync.Mutex
+	seen := make(map[string]bool)
+	process := func(s RepoStatus) {
+		resultMu.Lock()
+		if seen[s.Path] {
+			resultMu.Unlock()
+			return
+		}
+		seen[s.Path] = true
+		resultMu.Unlock()
 		if !(s.Archived && runOpts.RemoveArchived && !hasStatusError(s) && !s.Missing) {
-			progress.detail("  [START] %s: sync\n", s.Path)
+			progress.detail("  [START] %s: %s\n", s.Path, action)
 		}
 		if s.Removed {
-			progress.finish("  [REMOVE] %s: transferred checkout safely removed\n", s.Path)
-			removed++
-			continue
+			progress.finish("  [REMOVE] %s: obsolete checkout safely removed\n", s.Path)
+			removed.Add(1)
+			return
 		}
 		opts := optMap[s.Target]
 		tok := tokenMap[s.Target]
 
 		if hasStatusError(s) {
 			progress.finish("  [ERROR] %s: %s\n", s.Path, statusErrorMessage(s))
-			failed++
-			continue
+			failed.Add(1)
+			return
 		}
 		if s.Missing {
 			progress.finish("  [SKIP]  %s: missing\n", s.Path)
-			skipped++
-			continue
+			skipped.Add(1)
+			return
 		}
 		if s.IdentityIssue != "" || s.Orphan {
-			progress.finish("  [SKIP]  %s: %s\n", s.Path, s.IdentityIssue)
-			skipped++
-			continue
+			issue := strings.Replace(s.IdentityIssue, "; run tugboat sync "+s.Target, "", 1)
+			progress.finish("  [SKIP]  %s: %s\n", s.Path, issue)
+			skipped.Add(1)
+			return
 		}
 		if s.Archived {
 			if runOpts.RemoveArchived {
+				resultMu.Lock()
 				archivedStatuses = append(archivedStatuses, s)
+				resultMu.Unlock()
 			} else {
 				progress.finish("  [SKIP]  %s: archived\n", s.Path)
-				skipped++
+				skipped.Add(1)
 			}
-			continue
+			return
 		}
 		if isEmptyRepository(s) {
 			progress.finish("  [SKIP]  %s: no commits locally or on origin\n", s.Path)
-			skipped++
-			continue
+			skipped.Add(1)
+			return
+		}
+		if runOpts.Mode == SyncPush {
+			if s.Behind > 0 {
+				progress.finish("  [SKIP]  %s: behind remote, pull first\n", s.Path)
+				skipped.Add(1)
+			} else if s.Ahead == 0 {
+				progress.finish("  [OK]    %s: nothing to push\n", s.Path)
+			} else if err := m.confirmStatusIdentity(s); err != nil {
+				progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+				failed.Add(1)
+			} else if err := gitPush(s.Path, tok); err != nil {
+				progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+				failed.Add(1)
+			} else {
+				progress.finish("  [PUSH]  %s: %d commits\n", s.Path, s.Ahead)
+				synced.Add(1)
+			}
+			return
+		}
+		if runOpts.Mode == SyncPull && s.RemoteEmpty {
+			progress.finish("  [SKIP]  %s: origin has no commits\n", s.Path)
+			skipped.Add(1)
+			return
 		}
 		if err := m.confirmStatusIdentity(s); err != nil {
 			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-			continue
+			failed.Add(1)
+			return
 		}
 		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
 		if err != nil {
 			var skipErr *updateSkipError
 			if errors.As(err, &skipErr) {
 				progress.finish("  [SKIP]  %s: %s\n", s.Path, skipErr.reason)
-				skipped++
-				continue
+				skipped.Add(1)
+				return
 			}
 			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
-			continue
+			failed.Add(1)
+			return
 		}
 		if switched {
 			progress.note(s.Path, "switched "+s.Branch+" -> "+prepared.DefaultBranch)
@@ -2124,13 +1931,13 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		}
 		if hasStatusError(prepared) {
 			progress.finish("  [ERROR] %s: %s\n", prepared.Path, statusErrorMessage(prepared))
-			failed++
-			continue
+			failed.Add(1)
+			return
 		}
 		if prepared.Dirty {
 			progress.finish("  [SKIP]  %s: dirty\n", prepared.Path)
-			skipped++
-			continue
+			skipped.Add(1)
+			return
 		}
 
 		if prepared.Behind > 0 {
@@ -2139,32 +1946,46 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 				progress.detail("  [REBASE] %s: %d behind, %d ahead (diverged)\n", prepared.Path, prepared.Behind, prepared.Ahead)
 				if err := gitPullRebase(prepared.Path, tok); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
-					failed++
-					continue
+					failed.Add(1)
+					return
 				}
 			} else {
 				progress.detail("  [PULL]  %s: %d behind\n", prepared.Path, prepared.Behind)
 				if err := gitPull(prepared.Path, opts.Sync.GetFFOnly(), tok); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
-					failed++
-					continue
+					failed.Add(1)
+					return
 				}
 			}
 		}
-		if prepared.Ahead > 0 {
+		if prepared.Ahead > 0 && runOpts.Mode != SyncPull {
 			progress.detail("  [PUSH]  %s: %d ahead\n", prepared.Path, prepared.Ahead)
 			if err := gitPush(prepared.Path, tok); err != nil {
 				progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
-				failed++
-				continue
+				failed.Add(1)
+				return
 			}
 		}
-		if prepared.Ahead == 0 && prepared.Behind == 0 {
-			progress.finish("  [OK]    %s: up to date\n", prepared.Path)
+		if prepared.Behind == 0 && (prepared.Ahead == 0 || runOpts.Mode == SyncPull) {
+			message := "up to date"
+			if prepared.Ahead > 0 {
+				message = "nothing to pull; local commits retained"
+			}
+			progress.finish("  [OK]    %s: %s\n", prepared.Path, message)
+		} else if runOpts.Mode == SyncPull {
+			progress.finish("  [PULL]  %s\n", prepared.Path)
+			synced.Add(1)
 		} else {
 			progress.finish("  [SYNC]  %s\n", prepared.Path)
 		}
-		synced++
+		if runOpts.Mode != SyncPull {
+			synced.Add(1)
+		}
+	}
+
+	alreadySeen := func(path string) bool { resultMu.Lock(); defer resultMu.Unlock(); return seen[path] }
+	if err := m.streamSync(targets, runOpts, progress, alreadySeen, process); err != nil {
+		return err
 	}
 
 	// A parent checkout may contain foldouts. Remove deepest paths first, then
@@ -2184,11 +2005,11 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			var skipErr *archiveSkipError
 			if errors.As(err, &skipErr) {
 				progress.finish("  [SKIP]  %s: archived, %s\n", s.Path, skipErr.reason)
-				skipped++
+				skipped.Add(1)
 				continue
 			}
 			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
-			failed++
+			failed.Add(1)
 			continue
 		}
 		if fastForwarded {
@@ -2196,19 +2017,19 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			progress.detail("  [PULL]  %s: fast-forwarded archived default branch\n", s.Path)
 		}
 		progress.finish("  [REMOVE] %s: archived checkout removed\n", s.Path)
-		removed++
+		removed.Add(1)
 	}
 
-	if runOpts.RemoveArchived {
-		fmt.Printf("Sync complete: %d synced, %d removed, %d skipped, %d failed\n", synced, removed, skipped, failed)
-		if failed > 0 {
-			return fmt.Errorf("sync completed with %d operational errors", failed)
+	if runOpts.RemoveArchived || removed.Load() > 0 {
+		fmt.Printf("%s complete: %d %s, %d removed, %d skipped, %d failed\n", label, synced.Load(), word, removed.Load(), skipped.Load(), failed.Load())
+		if failed.Load() > 0 {
+			return fmt.Errorf("sync completed with %d operational errors", failed.Load())
 		}
 		return nil
 	}
-	fmt.Printf("Sync complete: %d synced, %d skipped, %d failed\n", synced, skipped, failed)
-	if reconcileFailed {
-		return fmt.Errorf("sync completed with reconciliation errors")
+	fmt.Printf("%s complete: %d %s, %d skipped, %d failed\n", label, synced.Load(), word, skipped.Load(), failed.Load())
+	if failed.Load() > 0 {
+		return fmt.Errorf("%s completed with %d errors", action, failed.Load())
 	}
 	return nil
 }
@@ -2311,4 +2132,63 @@ func (m *Manager) List(targetNames []string, includeArchived bool, workers int) 
 		fmt.Println()
 	}
 	return nil
+}
+
+func (m *Manager) scanStatus(job statusJob, metadata *scanMetadata, probe *historyProbe, progress *progressReporter, failure error) statusResult {
+	defer progress.checkFinished(job.path)
+	var timing RepoTiming
+	if job.missing {
+		s := m.inspectIdentity(job, metadata.index[orgKey{job.provider, job.org}.string()], probe)
+		if err := metadata.errors[orgKey{job.provider, job.org}.string()]; err != nil {
+			s.MetadataError = err.Error()
+		}
+		if failure != nil {
+			s.Error, s.ReconcileError = failure.Error(), true
+		}
+		if progress != nil {
+			s.Removed = progress.removed[job.path]
+		}
+		return statusResult{status: s}
+	}
+	key := orgKey{job.provider, job.org}.string()
+	identity := RepoStatus{Path: job.path, Target: job.target, Provider: job.provider, Org: job.org, Name: job.name}
+	if metadataErr := metadata.errors[key]; metadataErr != nil {
+		identity.MetadataError = metadataErr.Error()
+	} else {
+		identity = m.inspectIdentity(job, metadata.index[key], probe)
+	}
+	if failure != nil {
+		identity.Error, identity.ReconcileError = failure.Error(), true
+	}
+	fetch := !hasStatusError(identity) && identity.IdentityIssue == "" && !identity.Orphan
+	if fetch {
+		var err error
+		if progress == nil {
+			err = m.confirmStatusIdentity(identity)
+		} else {
+			err = m.saveVerifiedIdentity(identity)
+		}
+		if err != nil {
+			identity.Error = err.Error()
+			fetch = false
+		}
+	}
+	status := getRepoStatusWithProgressAndFetch(job.path, job.target, job.org, job.name, job.provider, job.token, &timing, progress, fetch)
+	if fetch && status.RemoteError == "" {
+		if err := m.confirmStatusIdentity(identity); err != nil {
+			identity.Error = err.Error()
+		}
+	}
+	status.IdentityIssue, status.RepositoryID, status.RemoteName = identity.IdentityIssue, identity.RepositoryID, identity.RemoteName
+	status.ReplacementID, status.identity, status.repository = identity.ReplacementID, identity.identity, identity.repository
+	status.gitDirInfo = identity.gitDirInfo
+	status.ReconcileError, status.Orphan, status.MetadataError = identity.ReconcileError, identity.Orphan, identity.MetadataError
+	status.Transferred = identity.Transferred
+	if identity.Error != "" {
+		status.Error = identity.Error
+	}
+	if identity.repository != nil {
+		applyRemoteState(&status, *identity.repository)
+	}
+	return statusResult{status: status, timing: timing}
 }

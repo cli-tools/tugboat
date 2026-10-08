@@ -698,7 +698,7 @@ func TestArchivedRemovalProtectsHiddenGitWork(t *testing.T) {
 				commitFile(t, repo.workPath, "local.txt", "local\n", "local work")
 				runGit(t, repo.workPath, "switch", "main")
 			},
-			wantReason: "local-only commits",
+			wantReason: "branch local-work (1)",
 		},
 		{
 			name: "stash",
@@ -706,7 +706,7 @@ func TestArchivedRemovalProtectsHiddenGitWork(t *testing.T) {
 				writeFile(t, filepath.Join(repo.workPath, "README.md"), "stashed\n")
 				runGit(t, repo.workPath, "stash", "push", "-m", "saved work")
 			},
-			wantReason: "local-only commits",
+			wantReason: "stash (",
 		},
 		{
 			name: "local tag commit",
@@ -717,7 +717,7 @@ func TestArchivedRemovalProtectsHiddenGitWork(t *testing.T) {
 				runGit(t, repo.workPath, "switch", "main")
 				runGit(t, repo.workPath, "branch", "-D", "tagged-work")
 			},
-			wantReason: "local-only commits",
+			wantReason: "tag local-only (1)",
 		},
 		{
 			name: "active operation",
@@ -1019,4 +1019,13 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s (dir=%s) failed: %v\n%s", strings.Join(args, " "), dir, err, string(output))
 	}
 	return string(output)
+}
+
+func gitText(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := gitOutput(dir, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

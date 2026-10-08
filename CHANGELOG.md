@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.9.1 - 2026-10-09
 
 - Replace standalone `clone`, `pull`, and `push` with `sync --clone-only`, `sync --pull`, and `sync --push`. Direction switches are mutually exclusive. Default sync and pull-only sync also clone missing active repos, honoring organization exclusions and foldouts.
 - Keep pull-only sync from pushing local commits. Push-only sync never clones, pulls, or switches branches.

@@ -116,7 +116,7 @@ func (m *Manager) confirmRepository(provider, org string, r remote.Repository) e
 		return fmt.Errorf("no client for provider %s", provider)
 	}
 	org = repositoryOwner(r, org)
-	current, err := client.GetRepo(org, r.Name)
+	current, err := remote.GetRepoFresh(client, org, r.Name)
 	if err != nil {
 		return err
 	}

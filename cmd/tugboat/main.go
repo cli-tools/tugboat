@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
+	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/repo"
 )
 
@@ -51,6 +53,37 @@ func parseVerbose(args []string) (bool, []string) {
 		}
 	}
 	return verbose, remaining
+}
+
+func parseRefresh(args []string) (bool, []string) {
+	refresh := false
+	var remaining []string
+	for _, arg := range args {
+		if arg == "--refresh" {
+			refresh = true
+		} else {
+			remaining = append(remaining, arg)
+		}
+	}
+	return refresh, remaining
+}
+
+// All repository commands share the same discovery store. Commands that act on
+// repositories refresh remote data and publish those results for later listings.
+func newCommandManager(cfg *config.Config, refresh, reuseRemote bool) (*repo.Manager, error) {
+	clients, err := cfg.BuildRemoteClients()
+	if err != nil {
+		return nil, err
+	}
+	store := cache.Default()
+	for name, client := range clients {
+		p := cfg.Providers[name]
+		clients[name] = &remote.CachedClient{Client: client, Store: store,
+			Scope: cache.Key(p.Type, p.APIURL, p.Token), Refresh: refresh || !reuseRemote}
+	}
+	manager := repo.NewManager(clients, cfg)
+	manager.Cache, manager.RefreshCache = store, refresh
+	return manager, nil
 }
 
 // resolveWorkers returns CLI workers if set, otherwise config workers (0 = use CPU count)
@@ -172,6 +205,7 @@ Global Options:
   -w, --workers N   Number of parallel workers (default: config "workers" or CPU cores)
   -d, --debug       Show timing information (status command only)
       --verbose     Show detailed sync activity
+      --refresh     Bypass discovery caches (sync, status, list)
 
 Configuration:
   tugboat reads from ~/.config/tugboat/config.json or TUGBOAT_CONFIG env var
@@ -201,6 +235,7 @@ Examples:
   tugboat status --all   # Include clean repository rows
   tugboat status -w 16   # Use 16 parallel workers
   tugboat list           # List all managed repos
+  tugboat list --refresh # Refresh cached repository discovery
 `
 	fmt.Print(help)
 }
@@ -213,6 +248,7 @@ func runSync(args []string) {
 	}
 
 	verbose, args := parseVerbose(args)
+	refresh, args := parseRefresh(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 	opts, targetNames, err := parseSyncArgs(args)
@@ -222,12 +258,11 @@ func runSync(args []string) {
 	}
 	opts.Workers = workers
 
-	clients, err := cfg.BuildRemoteClients()
+	manager, err := newCommandManager(cfg, refresh, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
 		os.Exit(1)
 	}
-	manager := repo.NewManager(clients, cfg)
 	manager.Verbose = verbose
 
 	if err := manager.Sync(targetNames, opts); err != nil {
@@ -243,16 +278,16 @@ func runStatus(args []string) {
 		os.Exit(1)
 	}
 
+	refresh, args := parseRefresh(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 	debug, showAll, targetNames := parseStatusArgs(args)
 
-	clients, err := cfg.BuildRemoteClients()
+	manager, err := newCommandManager(cfg, refresh, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
 		os.Exit(1)
 	}
-	manager := repo.NewManager(clients, cfg)
 
 	if err := manager.Status(targetNames, repo.StatusOptions{Debug: debug, ShowAll: showAll, Workers: workers}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error showing status: %v\n", err)
@@ -267,6 +302,7 @@ func runList(args []string) {
 		os.Exit(1)
 	}
 
+	refresh, args := parseRefresh(args)
 	cliWorkers, args := parseWorkers(args)
 	workers := resolveWorkers(cliWorkers, cfg)
 	includeArchived := false
@@ -280,12 +316,11 @@ func runList(args []string) {
 		}
 	}
 
-	clients, err := cfg.BuildRemoteClients()
+	manager, err := newCommandManager(cfg, refresh, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error building clients: %v\n", err)
 		os.Exit(1)
 	}
-	manager := repo.NewManager(clients, cfg)
 
 	if err := manager.List(targetNames, includeArchived, workers); err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing repositories: %v\n", err)

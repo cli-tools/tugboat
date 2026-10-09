@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.10.1 - 2026-10-09
+
+- Cache history-verified checkout identities outside repositories, with invalidation when checkout or provider details change. Keep explicit `.git/tugboat.json` metadata authoritative.
+- Cache remote metadata and local listing results for five minutes, including unresolved identities that previously repeated expensive archive-history searches.
+- Share discovery cache setup across `list`, `status`, and every sync mode. Status and sync refresh the shared remote cache with live responses; fetch, clone, rename, and removal confirmation checks bypass remote caches.
+- Verify locally available advertised upstream commits before downloading identity history, ignoring local replacement refs, grafts, and checkout URL rewrites. Run local listing checks in parallel using `--workers`.
+- Let sync's parallel scheduler recognize externally cached verified identities. Status reuses unresolved read-only discovery results while checking current worktree and branch state.
+- Support `--refresh` on `list`, `status`, and every sync mode to bypass discovery cache reads.
+
 ## v0.10.0 - 2026-10-09
 
 - Replace standalone `clone`, `pull`, and `push` with `sync --clone-only`, `sync --pull`, and `sync --push`. Direction switches are mutually exclusive. Default sync and pull-only sync also clone missing active repos, honoring organization exclusions and foldouts.

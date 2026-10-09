@@ -13,8 +13,9 @@ import (
 )
 
 type scanMetadata struct {
-	index  map[string]map[string]remote.Repository
-	errors map[string]error
+	index    map[string]map[string]remote.Repository
+	errors   map[string]error
+	readOnly bool
 }
 
 // Receiving syncs provision missing checkouts without printing an intermediate

@@ -9,7 +9,7 @@ Multi-repository management for Gitea and GitHub, with repo-centric targets and 
 **Prebuilt binaries:** Download from [GitHub Releases](https://github.com/cli-tools/tugboat/releases)
 ```bash
 # Example for Linux amd64
-VERSION=v0.10.0
+VERSION=v0.10.1
 curl -L "https://github.com/cli-tools/tugboat/releases/download/${VERSION}/tugboat-${VERSION}-linux-amd64" -o tugboat
 chmod +x tugboat
 sudo mv tugboat /usr/local/bin/
@@ -84,7 +84,7 @@ tugboat sync --remove-archived  # safely remove archived local checkouts
 - `sync --clone-only [target ...]` — clone and reconcile without updating branches; accepts `-E/--exclude-empty` and `-a/--include-archived`
 - `sync --remove-archived [target ...]` — additionally remove safe in-org archives and obsolete renamed duplicates; also works with `--pull`
 - `status [target ...]` — show archived/attention/missing/empty state; `--all` expands clean rows
-- `list [target ...]` — show local + remote; `-a/--include-archived` includes archives
+- `list [target ...]` — show local + remote; `-a/--include-archived` includes archives; `--refresh` bypasses discovery caches
 - `migrate`, `help`, `version`
 
 `--pull`, `--push`, and `--clone-only` are mutually exclusive. The former
@@ -164,7 +164,8 @@ retains unresolved identities and old names reused by a replacement repository.
 
 Tugboat saves provider instance and repository ID in `.git/tugboat.json`. It
 checks identity before fetching into local refs. `status` and `list` report
-pending changes without moving folders or saving identity metadata. `sync --push` skips pending repairs; receiving sync modes resolve organization targets.
+pending changes without moving folders or saving identity metadata inside the
+checkout. `sync --push` skips pending repairs; receiving sync modes resolve organization targets.
 Explicit repo targets and foldouts report conflicts without relocating their
 configured paths or editing configuration.
 
@@ -177,9 +178,38 @@ against accessible archives on the provider, including archives transferred out
 of the organization. Only a unique archive match permits
 recovery. This also works after an attempted pull has fetched the replacement
 into `origin/*`. Multiple archive matches, shallow histories, and ambiguous empty
-histories require manual identification. Candidate histories are cached in
+histories require manual identification. Before downloading history for an active
+upstream, Tugboat checks whether a freshly advertised remote commit already
+exists locally and shares ancestry with HEAD. Candidate histories are cached in
 temporary bare repositories within a command. Servers supporting filtered fetches
 send commit ancestry without file contents.
+
+Discovery results also persist under `$XDG_CACHE_HOME/tugboat/discovery-v1`
+(normally `~/.cache/tugboat/discovery-v1`). History-verified local identities are
+reused for up to 30 days when the checkout path, HEAD, origin, Git configuration,
+shallow state, provider instance, and Git directory modification time match.
+An explicit `.git/tugboat.json` always takes precedence. Current remote metadata
+still resolves the cached repository ID, so renames and reused names retain their
+identity checks. Dirty state and branch synchronization results are never cached.
+
+`list` caches remote metadata and local listing results, including unresolved
+identities, for five minutes. Remote entries are separate for each provider
+instance and credential; local results also depend on remote metadata and any
+explicit identity file. Local checks run in parallel using
+`--workers`. All repository commands share the cache setup: `sync` (including
+`--pull`, `--push`, and `--clone-only`) and `status` reuse verified local
+identities and refresh the remote cache with live provider responses. Sync's
+parallel scheduler recognizes externally cached identities as well as saved
+checkout metadata. `status` also reuses unresolved discovery results, while
+always checking current worktree and branch state. Sync does not reuse unresolved
+listing results, and fetch, clone, rename, and removal confirmation checks always
+bypass remote caches.
+
+Use `--refresh` with `list`, `status`, or any `sync` mode to bypass discovery
+cache reads and refresh local identity verification. Remote metadata in `sync`
+and `status` is always live, regardless of this flag.
+Missing, corrupt, expired, or unwritable caches fall back to normal discovery.
+Removing the discovery cache directory is safe; the next run rebuilds it.
 
 To identify an ambiguous checkout, obtain its **correct repository ID** from the
 provider API and create `.git/tugboat.json` in that checkout, for example:
@@ -264,11 +294,11 @@ pending changes and retain ordinary cloning and update commands.
 
 The repository includes an Agent Skills-compatible guide at [`skills/tugboat/SKILL.md`](skills/tugboat/SKILL.md). Official binary releases do not install it automatically.
 
-For Codex, install the skill matching the v0.10.0 binary with:
+For Codex, install the skill matching the v0.10.1 binary with:
 
 ```bash
 SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-SKILL_VERSION=v0.10.0
+SKILL_VERSION=v0.10.1
 mkdir -p "$SKILLS_DIR/tugboat"
 curl -fsSL "https://raw.githubusercontent.com/cli-tools/tugboat/${SKILL_VERSION}/skills/tugboat/SKILL.md" \
   -o "$SKILLS_DIR/tugboat/SKILL.md"

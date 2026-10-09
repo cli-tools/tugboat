@@ -51,6 +51,7 @@ tugboat version               # Show version
 - `--clone-only` - Clone and reconcile without updating branches
 - Direction switches are mutually exclusive; standalone `clone`, `pull`, and `push` commands are removed in v0.10.0. Update scripts to use the corresponding sync switches.
 - `-w, --workers N` - Parallel workers (default: CPU cores)
+- `--refresh` - Bypass discovery cache reads (list, status, and every sync mode)
 - `-d, --debug` - Show timing info (status only)
 - `--verbose` - Show provider metadata, reconciliation, identity downloads, check completions, Git operations, and update-start messages (sync). Default output has the initial sync line, one final result per repository as it completes, and the summary, numbered `[done/total]`. Known local and remote checkout paths are counted up front; the total adjusts for renames and newly discovered foldouts. Verified checkouts update before slower identity reconciliation; cloning also reports incrementally.
 - `--all` - Include clean repository rows (status only)
@@ -59,6 +60,8 @@ tugboat version               # Show version
 - `-a, --include-archived` - Include archived repos (sync --clone-only or list)
 
 ## Configuration
+
+Repository commands share discovery data under `$XDG_CACHE_HOME/tugboat/discovery-v1` (normally `~/.cache/tugboat/discovery-v1`). Verified local identities can be reused for up to 30 days while checkout details match; explicit `.git/tugboat.json` takes precedence. List caches remote metadata and local results for five minutes. Status and all sync modes refresh the shared remote cache with live provider responses. Status can also reuse unresolved read-only discovery results, but recomputes worktree and branch state. Sync's parallel scheduler uses cached verified identities, and sync never relies on unresolved listing results. Fetch, clone, rename, and removal confirmation checks bypass remote caches. Use `--refresh` on list, status, or any sync mode to bypass cache reads. Removing the cache directory is safe.
 
 ### Config File Locations (in order)
 1. `$TUGBOAT_CONFIG`

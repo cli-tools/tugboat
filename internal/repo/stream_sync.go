@@ -10,7 +10,7 @@ import (
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/pool"
 )
 
-// Saved identity and canonical origin let ordinary checkouts run independently
+// Verified identity and canonical origin let ordinary checkouts run independently
 // of the coordinator that owns rename, replacement, and retirement paths.
 func (m *Manager) independentCheckout(job statusJob, metadata *scanMetadata) bool {
 	if job.missing {
@@ -27,16 +27,19 @@ func (m *Manager) independentCheckout(job statusJob, metadata *scanMetadata) boo
 	if !ok {
 		return false
 	}
-	id, err := readIdentity(job.path)
+	provider := m.config.Providers[job.provider]
+	origin, err := checkoutOrigin(job.path)
+	if err != nil || !originMatches(origin, r) {
+		return false
+	}
+	id, _, err := m.loadCheckoutIdentity(job.path, origin, provider)
 	if err != nil || id == nil || id.Pending != nil || id.RepositoryID != r.ID {
 		return false
 	}
-	provider := m.config.Providers[job.provider]
 	if id.ProviderType != provider.Type || id.APIURL != providerIdentityURL(provider.APIURL) {
 		return false
 	}
-	origin, err := checkoutOrigin(job.path)
-	return err == nil && originMatches(origin, r)
+	return true
 }
 
 func (m *Manager) streamSync(targets []config.Target, opts SyncOptions, progress *progressReporter, done func(string) bool, process func(RepoStatus)) error {

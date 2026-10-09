@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/pool"
 	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
@@ -107,9 +108,12 @@ func (k orgKey) string() string { return k.provider + "|" + k.org }
 
 type Manager struct {
 	// Verbose includes diagnostic activity alongside numbered progress.
-	Verbose   bool
-	providers map[string]remote.Client
-	config    *config.Config
+	Verbose bool
+	// Cache holds disposable local discovery data, never repository state.
+	Cache        *cache.Store
+	RefreshCache bool
+	providers    map[string]remote.Client
+	config       *config.Config
 }
 
 func NewManager(providers map[string]remote.Client, cfg *config.Config) *Manager {
@@ -873,7 +877,7 @@ func (m *Manager) scanStatuses(targets []config.Target, debug bool, workers int,
 	probe := &historyProbe{progress: progress}
 	defer probe.close()
 	progress.beginChecks(len(jobs))
-	metadata := &scanMetadata{index: index, errors: metadataErrors}
+	metadata := &scanMetadata{index: index, errors: metadataErrors, readOnly: true}
 	results := pool.Run(jobs, workers, func(job statusJob) statusResult {
 		return m.scanStatus(job, metadata, probe, progress, nil)
 	})
@@ -1468,7 +1472,7 @@ func (m *Manager) confirmArchivedRepository(s RepoStatus) (*remote.Repository, e
 	if !ok {
 		return nil, fmt.Errorf("no client for provider %s", s.Provider)
 	}
-	repository, err := client.GetRepo(s.Org, s.RemoteName)
+	repository, err := remote.GetRepoFresh(client, s.Org, s.RemoteName)
 	if err != nil {
 		return nil, fmt.Errorf("checking archive state for %s/%s: %w", s.Org, s.Name, err)
 	}
@@ -2064,15 +2068,14 @@ func (m *Manager) List(targetNames []string, includeArchived bool, workers int) 
 			}
 		}
 		index, metadataErrors := m.buildRepoIndex(orgs, nil)
-		var local []RepoStatus
-		for _, job := range jobs {
+		local := pool.Run(jobs, workers, func(job statusJob) RepoStatus {
 			job.token = m.config.Providers[t.Provider].Token
 			if err := metadataErrors[orgKey{job.provider, job.org}.string()]; err != nil {
-				local = append(local, RepoStatus{Name: job.name, Path: job.path, Error: err.Error()})
-			} else {
-				local = append(local, m.inspectIdentity(job, index[orgKey{job.provider, job.org}.string()], probe))
+				return RepoStatus{Name: job.name, Path: job.path, Error: err.Error()}
 			}
-		}
+			return m.inspectListedIdentity(job, index[orgKey{job.provider, job.org}.string()], probe)
+		})
+		sort.Slice(local, func(i, j int) bool { return local[i].Path < local[j].Path })
 		if t.Repo == "" {
 			if err := metadataErrors[orgKey{t.Provider, t.Org}.string()]; err != nil {
 				fmt.Printf("  [ERROR] listing org: %v\n", err)
@@ -2155,7 +2158,11 @@ func (m *Manager) scanStatus(job statusJob, metadata *scanMetadata, probe *histo
 	if metadataErr := metadata.errors[key]; metadataErr != nil {
 		identity.MetadataError = metadataErr.Error()
 	} else {
-		identity = m.inspectIdentity(job, metadata.index[key], probe)
+		if metadata.readOnly {
+			identity = m.inspectReadOnlyIdentity(job, metadata.index[key], probe, true)
+		} else {
+			identity = m.inspectIdentity(job, metadata.index[key], probe)
+		}
 	}
 	if failure != nil {
 		identity.Error, identity.ReconcileError = failure.Error(), true

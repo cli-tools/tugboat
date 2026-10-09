@@ -162,13 +162,14 @@ func (m *Manager) originRedirectMatches(job statusJob, origin string, r remote.R
 // A probe owns an isolated object database. Candidate histories are fetched at
 // most once per scan; local refs, tags, FETCH_HEAD and worktrees are untouched.
 type historyProbe struct {
-	mu            sync.Mutex
-	dir           string
-	fetched       map[string]string
-	next          int
-	progress      *progressReporter
-	archives      map[string][]remote.Repository
-	archiveErrors map[string]error
+	mu               sync.Mutex
+	dir              string
+	advertisementDir string
+	fetched          map[string]string
+	next             int
+	progress         *progressReporter
+	archives         map[string][]remote.Repository
+	archiveErrors    map[string]error
 }
 
 func (p *historyProbe) archivedRepos(provider string, client remote.Client) ([]remote.Repository, error) {
@@ -202,6 +203,9 @@ func repositoryOwner(r remote.Repository, fallback string) string {
 func (p *historyProbe) close() {
 	if p.dir != "" {
 		_ = os.RemoveAll(p.dir)
+	}
+	if p.advertisementDir != "" {
+		_ = os.RemoveAll(p.advertisementDir)
 	}
 }
 
@@ -286,7 +290,7 @@ func (p *historyProbe) matches(dir, key, token, protocol string, r remote.Reposi
 		if gitRun(p.dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}") != nil {
 			continue
 		}
-		if _, err := gitOutput(p.dir, "merge-base", "refs/tugboat/local", ref+"^{commit}"); err == nil {
+		if _, err := originalHistoryMergeBase(p.dir, "refs/tugboat/local", ref+"^{commit}"); err == nil {
 			return true, nil
 		} else {
 			var exit *exec.ExitError
@@ -318,12 +322,12 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 		s.Error = err.Error()
 		return s
 	}
-	id, err := readIdentity(job.path)
+	p := m.config.Providers[job.provider]
+	id, cacheKey, err := m.loadCheckoutIdentity(job.path, origin, p)
 	if err != nil {
 		s.Error = err.Error()
 		return s
 	}
-	p := m.config.Providers[job.provider]
 	var resolved *remote.Repository
 	if id != nil {
 		if id.ProviderType != p.Type || id.APIURL != providerIdentityURL(p.APIURL) {
@@ -441,7 +445,13 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 				s.Error = "provider returned an invalid repository ID"
 				return s
 			}
-			match, err := probe.matches(job.path, orgKey{job.provider, job.org}.string(), job.token, p.Options.Clone.Protocol, upstream)
+			// Most checkouts already contain a current upstream commit. Confirm
+			// advertised tips before downloading a separate copy of its history.
+			match := probe.advertisedHistoryMatches(job.path, job.token, p.Options.Clone.Protocol, upstream)
+			var err error
+			if !match {
+				match, err = probe.matches(job.path, orgKey{job.provider, job.org}.string(), job.token, p.Options.Clone.Protocol, upstream)
+			}
 			if err != nil {
 				s.Error = "checking upstream history: " + err.Error()
 				return s
@@ -475,6 +485,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 			return s
 		}
 		var matches []remote.Repository
+		historyVerified := false
 		for _, r := range candidates {
 			if r.ID <= 0 {
 				s.Error = "provider returned an invalid repository ID"
@@ -496,6 +507,7 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 			}
 			if match {
 				matches = append(matches, r)
+				historyVerified = historyVerified || (headExists && !r.Empty)
 			}
 		}
 		if len(matches) != 1 {
@@ -521,10 +533,16 @@ func (m *Manager) inspectIdentity(job statusJob, repos map[string]remote.Reposit
 		}
 		resolved = &matches[0]
 		id = newIdentity(p, job.org, *resolved, origin)
+		if !historyVerified {
+			cacheKey = ""
+		}
 	}
 	if !safeRepoName(resolved.Name) || resolved.ID <= 0 {
 		s.Error = "provider returned an invalid repository name or ID"
 		return s
+	}
+	if cacheKey != "" && cacheKey == m.identityCacheKey(job.path, origin, p) {
+		m.Cache.Write(cacheKey, id)
 	}
 	s.identity, s.repository = id, resolved
 	applyRemoteState(&s, *resolved)

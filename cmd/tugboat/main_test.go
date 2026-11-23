@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/repo"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/repo"
 )
 
 func TestRefreshAppliesToEveryRepositoryCommand(t *testing.T) {

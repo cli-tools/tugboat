@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 func TestNewClient(t *testing.T) {

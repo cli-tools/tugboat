@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 // Identity belongs to a provider instance, not a mutable repository name or

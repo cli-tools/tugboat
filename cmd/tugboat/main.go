@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"strings"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/repo"
+	"github.com/cli-tools/tugboat/internal/cache"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/repo"
 )
 
 // parseWorkers extracts the --workers/-w flag value from args.

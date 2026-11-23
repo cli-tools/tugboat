@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 // Repository mirrors the Gitea API response. It stays here for direct use and

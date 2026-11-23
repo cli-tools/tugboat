@@ -1,4 +1,4 @@
-module gitea.swiftstrike.ai/swiftstrike/tugboat
+module github.com/cli-tools/tugboat
 
 go 1.21
 

@@ -17,10 +17,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/pool"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/cache"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/pool"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 type RepoTiming struct {

@@ -3,7 +3,7 @@ package remote
 import (
 	"time"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
+	"github.com/cli-tools/tugboat/internal/cache"
 )
 
 // CachedClient shares discovery data between commands. Refresh forces live

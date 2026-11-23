@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 // Cleanup can discard an obsolete name only while a separate canonical

@@ -3,9 +3,9 @@ package config
 import (
 	"fmt"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/gitea"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/github"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/gitea"
+	"github.com/cli-tools/tugboat/internal/github"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 // BuildRemoteClients instantiates remote clients for each configured provider.

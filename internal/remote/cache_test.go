@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/cache"
+	"github.com/cli-tools/tugboat/internal/cache"
 )
 
 type countingClient struct {

@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"strings"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/remote"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/remote"
 )
 
 const gitConfigLockMarker = "TUGBOAT-GIT-CONFIG-LOCK-V1\n"

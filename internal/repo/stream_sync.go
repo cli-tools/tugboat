@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/config"
-	"gitea.swiftstrike.ai/swiftstrike/tugboat/internal/pool"
+	"github.com/cli-tools/tugboat/internal/config"
+	"github.com/cli-tools/tugboat/internal/pool"
 )
 
 // Verified identity and canonical origin let ordinary checkouts run independently

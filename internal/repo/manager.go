@@ -247,7 +247,18 @@ type updateSkipError struct {
 	reason string
 }
 
+// ErrSyncReported indicates that the progress summary already reported the failures.
+var ErrSyncReported = errors.New("sync failures reported")
+
 func (e *updateSkipError) Error() string { return e.reason }
+
+func (m *Manager) printCloneFailure(r cloneResult) {
+	message := r.err.Error()
+	if m.Verbose && conciseLine(message) != message {
+		fmt.Printf("  [DETAIL] %s: %s\n", r.repoName, message)
+	}
+	fmt.Printf("  [ERROR] %s: %s\n", r.repoName, conciseLine(message))
+}
 
 func (m *Manager) Clone(targetNames []string, excludeEmpty, includeArchived bool, workers int) error {
 	return m.Sync(targetNames, SyncOptions{Mode: SyncCloneOnly, ExcludeEmpty: excludeEmpty, IncludeArchived: includeArchived, Workers: workers})
@@ -368,13 +379,13 @@ repositories:
 			fmt.Printf("  [CLONED] %s\n", r.repoName)
 			cloned++
 		} else {
-			fmt.Printf("  [ERROR]  %s: %v\n", r.repoName, r.err)
+			m.printCloneFailure(r)
 			failed++
 		}
 	}
 	fmt.Printf("Org %s: clone complete (%d cloned, %d failed)\n", t.Org, cloned, failed)
 	if failed > 0 {
-		return fmt.Errorf("%d clones failed", failed)
+		return ErrSyncReported
 	}
 	return nil
 }
@@ -491,12 +502,13 @@ func (m *Manager) cloneRepoWithFoldout(t config.Target, excludeEmpty, includeArc
 		if r.status == "cloned" {
 			fmt.Printf("  [CLONED] %s\n", r.repoName)
 		} else {
-			fmt.Printf("  [ERROR] %s: %v\n", r.repoName, r.err)
+			m.printCloneFailure(r)
 			failed++
 		}
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d foldout clones failed", failed)
+		fmt.Printf("Foldout: clone complete (%d cloned, %d failed)\n", len(results)-failed, failed)
+		return ErrSyncReported
 	}
 	return nil
 }
@@ -1103,46 +1115,89 @@ func gitFetchWithStderr(repoPath, token string) string {
 }
 
 // Pull/Push helpers used by sync-like commands
-func gitPull(repoPath string, ffOnly bool, token string) error {
+func gitPull(repoPath string, ffOnly bool, token string, progress *progressReporter) error {
 	args := []string{"pull"}
 	if ffOnly {
 		args = append(args, "--ff-only")
 	}
+	return syncGit(repoPath, token, progress, args...)
+}
+
+func syncGit(repoPath, token string, progress *progressReporter, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoPath
 	cmd.Env = gitEnvWithAuth(token)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Stderr.Write(out)
+		message := strings.TrimSpace(string(out))
+		if token != "" {
+			message = strings.ReplaceAll(message, token, "[redacted]")
+		}
+		progress.detail("  [DETAIL] %s: git %s failed: %s\n", repoPath, args[0], message)
+		return fmt.Errorf("git %s failed: %s", args[0], gitFailureReason(message, err))
 	}
 	return err
 }
 
-func gitPullRebase(repoPath string, token string) error {
-	cmd := exec.Command("git", "pull", "--rebase=merges")
-	cmd.Dir = repoPath
-	cmd.Env = gitEnvWithAuth(token)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// Abort the rebase so the repo is not left in a broken mid-rebase state.
-		abort := exec.Command("git", "rebase", "--abort")
-		abort.Dir = repoPath
-		abort.Env = gitEnvNoPrompt()
-		abort.Run() // best-effort
-		os.Stderr.Write(out)
+func gitFailureReason(message string, err error) string {
+	lines := strings.FieldsFunc(message, func(r rune) bool { return r == '\r' || r == '\n' })
+	for _, line := range lines {
+		if strings.HasPrefix(line, "fatal: ") || strings.HasPrefix(line, "error: ") {
+			return conciseLine(line)
+		}
 	}
-	return err
+	if len(lines) > 0 {
+		return conciseLine(lines[0])
+	}
+	return err.Error()
 }
 
-func gitPush(repoPath, token string) error {
-	cmd := exec.Command("git", "push")
-	cmd.Dir = repoPath
-	cmd.Env = gitEnvWithAuth(token)
-	out, err := cmd.CombinedOutput()
+func gitPullRebase(repoPath, token string, progress *progressReporter) error {
+	branch, err := gitOutput(repoPath, "symbolic-ref", "HEAD")
 	if err != nil {
-		os.Stderr.Write(out)
+		return fmt.Errorf("reading branch before rebase: %w", err)
 	}
-	return err
+	head, err := gitOutput(repoPath, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return fmt.Errorf("reading HEAD before rebase: %w", err)
+	}
+	pullErr := syncGit(repoPath, token, progress, "pull", "--rebase=merges")
+	if pullErr == nil {
+		return nil
+	}
+	op, err := activeGitOperation(repoPath)
+	if err == nil && op == "" {
+		return pullErr
+	}
+	recoveryErr := fmt.Errorf("could not verify rebase recovery. Run git status in this checkout")
+	if err != nil || (op != "rebase-merge" && op != "rebase-apply") {
+		return recoveryErr
+	}
+	dir, err := gitOutput(repoPath, "rev-parse", "--path-format=absolute", "--git-path", op)
+	if err != nil {
+		return recoveryErr
+	}
+	readMarker := func(name string) string {
+		data, _ := os.ReadFile(filepath.Join(strings.TrimSpace(dir), name))
+		return strings.TrimSpace(string(data))
+	}
+	if readMarker("head-name") != strings.TrimSpace(branch) || readMarker("orig-head") != strings.TrimSpace(head) {
+		return recoveryErr
+	}
+	reason := "rebase failed"
+	if files, err := gitOutput(repoPath, "diff", "--name-only", "--diff-filter=U"); err == nil && files != "" {
+		reason = "rebase conflict in " + conciseLine(files)
+	}
+	if err := syncGit(repoPath, "", progress, "rebase", "--abort"); err != nil {
+		return fmt.Errorf("%s. Abort failed. Run git status in this checkout", reason)
+	}
+	afterBranch, branchErr := gitOutput(repoPath, "symbolic-ref", "HEAD")
+	afterHead, headErr := gitOutput(repoPath, "rev-parse", "--verify", "HEAD")
+	op, err = activeGitOperation(repoPath)
+	if err != nil || op != "" || branchErr != nil || headErr != nil || afterBranch != branch || afterHead != head {
+		return recoveryErr
+	}
+	return fmt.Errorf("%s. Restored %s to %.7s", reason, strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/"), head)
 }
 
 // hasUpstreamRef fetches from origin and checks whether the current branch
@@ -1533,16 +1588,15 @@ func localUnpublishedWork(repoPath string, remoteObjectIDs []string) (unpublishe
 }
 
 func activeGitOperation(repoPath string) (string, error) {
-	markers := []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-apply", "rebase-merge", "sequencer"}
+	// These markers are private to the current worktree, including in linked
+	// worktrees. A rebase can also have a merge or cherry-pick in progress.
+	dir, err := gitOutput(repoPath, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return "", fmt.Errorf("resolving Git operation directory: %w", err)
+	}
+	markers := []string{"rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "sequencer"}
 	for _, marker := range markers {
-		gitPath, err := gitOutput(repoPath, "rev-parse", "--git-path", marker)
-		if err != nil {
-			return "", fmt.Errorf("resolving Git operation marker %s: %w", marker, err)
-		}
-		gitPath = strings.TrimSpace(gitPath)
-		if !filepath.IsAbs(gitPath) {
-			gitPath = filepath.Join(repoPath, gitPath)
-		}
+		gitPath := filepath.Join(strings.TrimSuffix(dir, "\n"), marker)
 		if _, err := os.Stat(gitPath); err == nil {
 			return marker, nil
 		} else if !os.IsNotExist(err) {
@@ -1898,7 +1952,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			} else if err := m.confirmStatusIdentity(s); err != nil {
 				progress.finish("  [ERROR] %s: %v\n", s.Path, err)
 				failed.Add(1)
-			} else if err := gitPush(s.Path, tok); err != nil {
+			} else if err := syncGit(s.Path, tok, progress, "push"); err != nil {
 				progress.finish("  [ERROR] %s: %v\n", s.Path, err)
 				failed.Add(1)
 			} else {
@@ -1915,6 +1969,15 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		if err := m.confirmStatusIdentity(s); err != nil {
 			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
 			failed.Add(1)
+			return
+		}
+		if operation, err := activeGitOperation(s.Path); err != nil {
+			progress.finish("  [ERROR] %s: %v\n", s.Path, err)
+			failed.Add(1)
+			return
+		} else if operation != "" {
+			progress.finish("  [SKIP]  %s: Git operation in progress (%s)\n", s.Path, operation)
+			skipped.Add(1)
 			return
 		}
 		prepared, switched, err := m.prepareRepoForDefaultBranch(s, tok)
@@ -1948,14 +2011,14 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 			if !prepared.CanFastForward && opts.Sync.GetFFOnly() {
 				// Diverged: ff-only would fail, go straight to rebase.
 				progress.detail("  [REBASE] %s: %d behind, %d ahead (diverged)\n", prepared.Path, prepared.Behind, prepared.Ahead)
-				if err := gitPullRebase(prepared.Path, tok); err != nil {
+				if err := gitPullRebase(prepared.Path, tok, progress); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 					failed.Add(1)
 					return
 				}
 			} else {
 				progress.detail("  [PULL]  %s: %d behind\n", prepared.Path, prepared.Behind)
-				if err := gitPull(prepared.Path, opts.Sync.GetFFOnly(), tok); err != nil {
+				if err := gitPull(prepared.Path, opts.Sync.GetFFOnly(), tok, progress); err != nil {
 					progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 					failed.Add(1)
 					return
@@ -1964,7 +2027,7 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 		}
 		if prepared.Ahead > 0 && runOpts.Mode != SyncPull {
 			progress.detail("  [PUSH]  %s: %d ahead\n", prepared.Path, prepared.Ahead)
-			if err := gitPush(prepared.Path, tok); err != nil {
+			if err := syncGit(prepared.Path, tok, progress, "push"); err != nil {
 				progress.finish("  [ERROR] %s: %v\n", prepared.Path, err)
 				failed.Add(1)
 				return
@@ -2027,13 +2090,13 @@ func (m *Manager) Sync(targetNames []string, runOpts SyncOptions) error {
 	if runOpts.RemoveArchived || removed.Load() > 0 {
 		fmt.Printf("%s complete: %d %s, %d removed, %d skipped, %d failed\n", label, synced.Load(), word, removed.Load(), skipped.Load(), failed.Load())
 		if failed.Load() > 0 {
-			return fmt.Errorf("sync completed with %d operational errors", failed.Load())
+			return ErrSyncReported
 		}
 		return nil
 	}
 	fmt.Printf("%s complete: %d %s, %d skipped, %d failed\n", label, synced.Load(), word, skipped.Load(), failed.Load())
 	if failed.Load() > 0 {
-		return fmt.Errorf("%s completed with %d errors", action, failed.Load())
+		return ErrSyncReported
 	}
 	return nil
 }

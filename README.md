@@ -104,6 +104,11 @@ on stdout, including redirected logs. Add `--verbose` for provider metadata and
 reconciliation diagnostics, identity downloads, check completions, Git operations,
 and update-start messages: `tugboat sync --pull t1 --verbose`.
 
+If an automatic rebase conflicts, the result names a conflicting file and
+reports whether Tugboat restored the original branch and commit. A failed
+update counts once in the summary and causes a nonzero exit after the other
+repositories finish. Use `--verbose` for Git diagnostics.
+
 
 ## Clone exclusions
 

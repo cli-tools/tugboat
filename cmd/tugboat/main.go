@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -266,7 +267,13 @@ func runSync(args []string) {
 	manager.Verbose = verbose
 
 	if err := manager.Sync(targetNames, opts); err != nil {
-		fmt.Fprintf(os.Stderr, "Error syncing repositories: %v\n", err)
+		if !errors.Is(err, repo.ErrSyncReported) {
+			message := err.Error()
+			if !verbose {
+				message, _, _ = strings.Cut(strings.ReplaceAll(message, "\r", "\n"), "\n")
+			}
+			fmt.Fprintf(os.Stderr, "Error syncing repositories: %s\n", message)
+		}
 		os.Exit(1)
 	}
 }

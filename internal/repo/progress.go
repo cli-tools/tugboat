@@ -54,13 +54,34 @@ func (p *progressReporter) checkFinished(path string) {
 	fmt.Fprintf(p.out, "  [%*d/%d] Checked %s\n", len(fmt.Sprint(p.total)), p.checked, p.total, path)
 }
 
+func conciseLine(message string) string {
+	line, _, _ := strings.Cut(strings.ReplaceAll(strings.TrimSpace(message), "\r", "\n"), "\n")
+	runes := []rune(line)
+	if len(runes) > 240 {
+		return string(runes[:239]) + "…"
+	}
+	return line
+}
+
 // finish records an update outcome, independently of scan completion.
 func (p *progressReporter) finish(format string, args ...any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.completed++
 	line := strings.TrimSpace(fmt.Sprintf(format, args...))
-	line = strings.ReplaceAll(line, "\n", "; ")
+	if strings.ContainsAny(line, "\r\n") {
+		if p.verbose {
+			fmt.Fprintf(p.out, "  [DETAIL] %s\n", line)
+		}
+		parts := strings.FieldsFunc(line, func(r rune) bool { return r == '\n' || r == '\r' })
+		if len(parts) > 3 {
+			parts = append(parts[:3], "… (use --verbose)")
+		}
+		for i := range parts {
+			parts[i] = conciseLine(parts[i])
+		}
+		line = strings.Join(parts, "; ")
+	}
 	if len(args) > 0 {
 		if path, ok := args[0].(string); ok {
 			p.planLocked(path)

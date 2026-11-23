@@ -1,8 +1,10 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +12,94 @@ import (
 	"github.com/cli-tools/tugboat/internal/config"
 	"github.com/cli-tools/tugboat/internal/remote"
 )
+
+func TestActiveOperationDuringRebaseMerge(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init")
+	if err := os.Mkdir(filepath.Join(dir, ".git", "rebase-merge"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, ".git", "MERGE_HEAD"), "merge in progress")
+	if op, err := activeGitOperation(dir); err != nil || op != "rebase-merge" {
+		t.Fatalf("active operation = %q, %v", op, err)
+	}
+}
+
+func TestSyncRebaseConflict(t *testing.T) {
+	for _, scenario := range []string{"default", "verbose", "abort failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			base := t.TempDir()
+			r := createTestRepo(t, base, "acme", "app", "main", filepath.Join(base, "app"))
+			other := createTestRepo(t, base, "acme", "other", "main", filepath.Join(base, "other"))
+			commitFile(t, other.workPath, "sync.txt", "publish", "independent update")
+			seed := cloneRepo(t, r.remotePath, filepath.Join(base, "seed"))
+			commitFile(t, r.workPath, "README.md", "local", "local change")
+			commitFile(t, seed, "README.md", "remote", "remote change")
+			runGit(t, seed, "push")
+			head := gitText(t, r.workPath, "rev-parse", "HEAD")
+			if scenario == "abort failure" {
+				realGit, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("REAL_GIT", realGit)
+				dir := t.TempDir()
+				script := "#!/bin/sh\nif [ \"$1 $2\" = 'rebase --abort' ]; then exit 1; fi\nexec \"$REAL_GIT\" \"$@\"\n"
+				if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+			}
+			m := newTestManager([]config.Target{repoTarget(r), repoTarget(other)}, fakeClientForRepos(r, other))
+			m.Verbose = scenario == "verbose"
+			stderr, err := os.CreateTemp(base, "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := os.Stderr
+			os.Stderr = stderr
+			defer func() { os.Stderr = old; stderr.Close() }()
+			output := captureStdout(t, func() {
+				if err := m.Sync(nil, SyncOptions{Workers: 2}); !errors.Is(err, ErrSyncReported) {
+					t.Fatalf("sync: %v", err)
+				}
+			})
+			if info, err := stderr.Stat(); err != nil || info.Size() != 0 {
+				t.Fatal("unexpected sync stderr")
+			}
+			if !strings.Contains(output, "[ERROR] "+r.workPath+": rebase conflict in README.md.") ||
+				!strings.Contains(output, "1 synced, 0 skipped, 1 failed") ||
+				strings.Contains(output, "could not apply") != m.Verbose {
+				t.Fatal(output)
+			}
+			if !m.Verbose && strings.Count(output, "\n") != 4 {
+				t.Fatal(output)
+			}
+			if gitText(t, r.remotePath, "rev-parse", "main") != gitText(t, seed, "rev-parse", "HEAD") ||
+				gitText(t, other.remotePath, "rev-parse", "main") != gitText(t, other.workPath, "rev-parse", "HEAD") {
+				t.Fatal("unexpected remote heads")
+			}
+			if scenario == "abort failure" {
+				if !strings.Contains(output, "Abort failed. Run git status") {
+					t.Fatal(output)
+				}
+				output = captureStdout(t, func() {
+					if err := m.Sync(nil, SyncOptions{Workers: 1}); err != nil {
+						t.Fatal(err)
+					}
+				})
+				if !strings.Contains(output, "Git operation in progress") || gitText(t, r.workPath, "ls-files", "-u") == "" {
+					t.Fatal(output)
+				}
+				return
+			}
+			if !strings.Contains(output, "Restored main to "+head[:7]) || gitText(t, r.workPath, "symbolic-ref", "--short", "HEAD") != "main\n" ||
+				gitText(t, r.workPath, "rev-parse", "HEAD") != head || gitText(t, r.workPath, "status", "--porcelain") != "" {
+				t.Fatal(output)
+			}
+		})
+	}
+}
 
 func TestReceivingSyncAcceptsCanonicalOrganizationCasing(t *testing.T) {
 	for _, explicit := range []bool{false, true} {

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.10.2 - 2026-11-23
+
+- Report failed Git updates on a single sync result line. Use `--verbose` for detailed Git output.
+- On an automatic rebase conflict, name a conflicting file and verify that the abort restored the original branch and commit. If recovery fails, point the user to `git status`.
+- Move the Go module to `github.com/cli-tools/tugboat` and use GitHub Actions for CI and releases. Tugboat continues to manage both GitHub and Gitea repositories.
+
 ## v0.10.1 - 2026-10-09
 
 - Cache history-verified checkout identities outside repositories, with invalidation when checkout or provider details change. Keep explicit `.git/tugboat.json` metadata authoritative.
